@@ -864,7 +864,7 @@ let dashboardYear = _now.getFullYear();
 let dashboardQuarter = 'Q' + (Math.floor(_now.getMonth()/3)+1);
 let dashboardMonth = _now.getMonth()+1;
 
-const API_URL = "https://script.google.com/macros/s/AKfycbz7m3D2Kju3YPxyGfs26zdTh3UnDwyJFefrtCc9pQsAeC5tgynD_JvT1BAxiWbwjZW6rg/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbyv-6sLA76qDRnCNeN9UutycOTMESFpB6rEHZRCSBUjKJSxRDiMkCn8u5m32Ne9_FMB-Q/exec";
 const USE_GOOGLE_SCRIPT_RUN = typeof google !== "undefined" && google.script && google.script.run;
 
 function apiJsonp(action, payload={}){
@@ -6554,6 +6554,1437 @@ window.hideGlobalLoading=function(){
   }
 })();
 </script>
+
+
+
+<script>
+/* ==== PATCH 2026-05-11B: UNIT RESPONSIBLE TASK VISIBILITY + MAIN STEP WORK PANEL
+   Fixes:
+   1) Manager đơn vị phối hợp thấy rõ nhiệm vụ phối hợp trong danh sách.
+   2) Manager của ResponsibleUnit thấy panel giao Main nếu còn bước thuộc đơn vị mình.
+   3) Main của các bước thấy panel giao Support, theo dõi tiến độ, cập nhật/đánh giá.
+*/
+(function(){
+  const $id = id => document.getElementById(id);
+  const txt = v => String(v == null ? '' : v).trim();
+  const low = v => txt(v).toLowerCase();
+  const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const arr = v => Array.isArray(v) ? v : [];
+  const meId = () => txt(window.me && window.me.UserID);
+  const meRole = () => txt(window.me && window.me.Role);
+  const meUnit = () => txt((window.me && (window.me.Unit || window.me.Department || window.me.DepartmentName)) || '');
+  const same = (a,b) => !!txt(a) && low(a) === low(b);
+  const isAdminLeader = () => ['Admin','Leader'].includes(meRole());
+  const isManager = () => meRole() === 'Manager';
+  const roleOf = r => /main|chính|chinh/i.test(txt(r)) ? 'Main' : (/support|hỗ trợ|ho tro/i.test(txt(r)) ? 'Support' : txt(r));
+  const stepUnit = s => txt(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit));
+  const taskId = () => txt(($id('TaskID')||{}).value || (window.currentTask && window.currentTask.TaskID));
+  const wf = () => window.taskWorkflow || {steps:[], supportTasks:[]};
+  function userById(id){ return arr(window.users || window.allUsers || []).find(u => txt(u.UserID) === txt(id)) || {}; }
+  function activeRowsForStep(stepId){ return arr(wf().supportTasks).filter(r => txt(r.WorkflowStepID || r.StepID) === txt(stepId) && low(r.IsActive) !== 'false'); }
+  function mainRowForStep(stepId){ return activeRowsForStep(stepId).find(r => roleOf(r.AssignmentRole || r.StepRole || r.Role) === 'Main') || null; }
+  function isMainOfStep(step){
+    if(!step) return false;
+    const uid = meId();
+    return txt(step.MainPersonID) === uid || !!mainRowForStep(step.StepID || step.WorkflowStepID)?.SupportPersonID && txt(mainRowForStep(step.StepID || step.WorkflowStepID).SupportPersonID) === uid;
+  }
+  function isSupportOfStep(step){ return activeRowsForStep(step.StepID || step.WorkflowStepID).some(r => txt(r.SupportPersonID) === meId() && roleOf(r.AssignmentRole || r.StepRole || r.Role) === 'Support'); }
+  function isManagerOfStep(step){ return isAdminLeader() || (isManager() && same(stepUnit(step), meUnit())); }
+  function canSeeStep(step){ return isAdminLeader() || isManagerOfStep(step) || isMainOfStep(step) || isSupportOfStep(step) || step.CanViewStep === true; }
+  function canAssignMain(step){ return isAdminLeader() || (isManager() && same(stepUnit(step), meUnit())) || step.CanAssignMain === true; }
+  function canAssignSupport(step){ return canAssignMain(step) || isMainOfStep(step) || step.CanAssignSupport === true; }
+  function canFinalEval(step){ return canAssignMain(step) || step.CanFinalEvaluate === true; }
+  function currentRoleForStep(step){ if(canAssignMain(step)) return 'Manager'; if(isMainOfStep(step)) return 'Main'; if(isSupportOfStep(step)) return 'Support'; return 'Viewer'; }
+  function currentVisibleSteps(){ return arr(wf().steps).filter(canSeeStep); }
+  function userOptions(selectedIds, onlyUnit){
+    const selected = arr(selectedIds).map(String);
+    let pool = arr(window.users || window.allUsers || []).filter(u => low(u.IsActive) !== 'false');
+    if(onlyUnit) pool = pool.filter(u => same(u.Unit || u.Department, onlyUnit));
+    if(!pool.length && onlyUnit) pool = arr(window.users || window.allUsers || []);
+    return pool.map(u => `<option value="${esc(u.UserID)}" ${selected.includes(String(u.UserID))?'selected':''}>${esc(u.FullName || u.UserID)} (${esc(u.Unit || u.Department || '')})</option>`).join('');
+  }
+
+  // Task list: distinguish phối hợp tasks for Managers.
+  window.__arihaRenderTasksUnitPatch = function(){
+    const tbody=$id('taskRows'); if(!tbody || !Array.isArray(window.tasks)) return false;
+    const q=($id('q')?.value||'').toLowerCase(), fg=$id('filterGroup')?.value||'Tất cả', fs=$id('filterStatus')?.value||'Tất cả';
+    const filtered=window.tasks.filter(t => (fg==='Tất cả'||t.TaskGroup===fg) && (fs==='Tất cả'||t.Status===fs) && JSON.stringify(t||{}).toLowerCase().includes(q));
+    const fullName=id => { const u=userById(id); return u.FullName || id || ''; };
+    const taskMainSupport = t => {
+      const main = t.CurrentUserTaskScope === 'Coordination' ? (t.UnitMainNames || t.MainPersonName || t.LeadPersonName || 'Chưa phân công') : (t.MainPersonName || t.UnitMainNames || t.LeadPersonName || 'Chưa phân công');
+      const sup = t.SupportNames || t.UnitSupportNames || 'Chưa phân công';
+      return {main, sup};
+    };
+    tbody.innerHTML = filtered.map((t,idx)=>{
+      const scope = t.CurrentUserTaskScope || '';
+      const scopeHtml = scope === 'Coordination' ? `<span class="pill st-support-assign">Nhiệm vụ phối hợp · ${esc(t.CurrentUserUnitStepCount||0)} bước ${esc(meUnit())}</span>` : (scope === 'PrimaryUnit' ? '<span class="pill st-main-assign">Đơn vị phụ trách chính</span>' : '');
+      const pending = Number(t.CurrentUserUnitPendingMainCount || 0);
+      const pendingHtml = pending>0 ? `<div class="muted"><b style="color:#b45309">Cần phân công Main: ${pending} bước</b></div>` : '';
+      const names=taskMainSupport(t);
+      const pct=Math.max(0,Math.min(100,Number(t.Progress||0)));
+      const statusCls = /hoàn thành/i.test(t.Status||'') ? 'st-ok' : (/chậm|quá hạn/i.test(t.Status||'') ? 'st-risk' : 'st-run');
+      return `<tr><td data-label="STT"><b>${idx+1}</b></td><td data-label="Nhiệm vụ" style="min-width:320px"><b>${esc(t.TaskName)}</b><div class="muted">${esc(t.TaskGroup||'')} · Tạo bởi: ${esc(t.CreatedByName||t.CreatorName||'')}</div>${scopeHtml}${pendingHtml}</td><td data-label="Người chính / hỗ trợ"><b>Thực hiện:</b> ${esc(names.main)}<br><span class="muted"><b>Hỗ trợ:</b> ${esc(names.sup)}</span></td><td data-label="KPI">${esc(t.KPIText||t.KPI||'')}</td><td data-label="Deadline">${esc(t.DueDate||t.Deadline||'')}</td><td data-label="Tiến độ"><div class="progress"><div class="bar" style="width:${pct}%"></div></div><div class="muted">${pct}%</div></td><td data-label="Trạng thái"><span class="pill ${statusCls}">${esc(t.Status||'')}</span></td><td data-label="Xếp loại cuối">${esc(t.FinalStatus||t.LeaderFinalRating||t.ManagerRating||'Chưa đánh giá')}</td><td data-label="Thao tác"><button class="btn secondary" onclick="openTaskById('${esc(t.TaskID)}')">Mở</button></td></tr>`;
+    }).join('') || '<tr><td colspan="9"><div class="muted">Không có nhiệm vụ phù hợp.</div></td></tr>';
+    return true;
+  };
+  window.renderTasksNow = window.__arihaRenderTasksUnitPatch;
+  window.renderTasks = function(){ if(window.__renderTimer) cancelAnimationFrame(window.__renderTimer); window.__renderTimer=requestAnimationFrame(()=>window.__arihaRenderTasksUnitPatch()); };
+
+  // Keep workflow loaded before rendering panels.
+  async function ensureWorkflowLoaded(){
+    const id=taskId();
+    if(!id) return;
+    const has = arr(wf().steps).some(s => txt(s.TaskID) === id || !s.TaskID);
+    if(!has && typeof window.loadTaskWorkflow === 'function') await window.loadTaskWorkflow(id);
+  }
+
+  window.arihaRenderUnitStepMainPanel = function(){
+    let host=$id('arihaUnitStepMainPanelHost');
+    const info=$id('taskTab-info');
+    if(!host && info){ host=document.createElement('div'); host.id='arihaUnitStepMainPanelHost'; const fixed=$id('arihaFixedApprovalPanel'); if(fixed && fixed.parentNode===info) fixed.insertAdjacentElement('afterend', host); else info.insertBefore(host, info.firstChild); }
+    if(!host) return;
+    const steps=arr(wf().steps).filter(s => canAssignMain(s));
+    if(!steps.length){ host.innerHTML=''; return; }
+    const pending=steps.filter(s => !mainRowForStep(s.StepID) && !txt(s.MainPersonID));
+    const unitLabel = isAdminLeader() ? 'các đơn vị được chọn' : meUnit();
+    host.innerHTML = `<div id="arihaUnitStepMainPanel" class="manager-main-eval-panel" style="border-color:#93c5fd;background:linear-gradient(135deg,#eff6ff,#ffffff);margin:12px 0 16px">
+      <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:10px"><div><h3 style="margin:0;color:#1e3a8a">PHÂN CÔNG MAIN CHO BƯỚC ${esc(unitLabel)}</h3><div class="muted">Manager đơn vị phối hợp được giao <b>01 người thực hiện chính</b> cho toàn bộ bước thuộc đơn vị mình. Main sau đó vào tab “Giao việc hỗ trợ” để giao Support theo từng bước.</div></div><span class="pill ${pending.length?'st-warn':'st-ok'}">${pending.length ? pending.length+' bước chờ Main' : 'Đã có Main'}</span></div>
+      <div class="formgrid"><div><label>Người thực hiện chính</label><select id="UnitStepMainPersonID"><option value="">Chọn người thực hiện chính</option>${userOptions([], isAdminLeader()?'' : meUnit())}</select><div class="muted">Danh sách ưu tiên nhân sự cùng đơn vị.</div></div><div><label>Các bước áp dụng</label><div class="readonly-note" style="margin:0">${steps.map(s=>{ const m=mainRowForStep(s.StepID); return `#${esc(s.StepNo||s.StepOrder||'')} ${esc(s.StepName||'Bước')} — ${esc(stepUnit(s))}: <b>${m?esc(m.SupportPersonName||m.SupportPersonID):(txt(s.MainPersonName)||'Chưa Main')}</b>`; }).join('<br>')}</div></div><div class="full" style="display:flex;justify-content:flex-end;gap:8px;flex-wrap:wrap"><button type="button" class="btn secondary" onclick="arihaRefreshUnitStepMainPanel()">Làm mới panel</button><button type="button" class="btn" onclick="arihaAssignMainForMyUnitSteps()">Lưu Main cho toàn bộ bước ${esc(unitLabel)}</button></div></div></div>`;
+  };
+  window.arihaAssignMainForMyUnitSteps = async function(){
+    const mainId=txt(($id('UnitStepMainPersonID')||{}).value);
+    if(!mainId) return alert('Chọn người thực hiện chính.');
+    const steps=arr(wf().steps).filter(s => canAssignMain(s));
+    if(!steps.length) return alert('Không có bước thuộc đơn vị bạn được phép phân công Main.');
+    const payload=steps.map(s => ({TaskID:taskId(), StepID:s.StepID, SupportPersonID:mainId, AssignmentRole:'Main', StepRole:'Main'}));
+    try{ await api('batchAssignWorkflowSteps',{assignments:payload}); alert('Đã phân công Main cho toàn bộ bước thuộc đơn vị/phạm vi của bạn.'); await loadTaskWorkflow(taskId()); window.arihaRenderUnitStepMainPanel(); window.renderTaskWorkflowBox(); if(window.renderTasks) window.renderTasks(); }catch(e){ alert(e.message||e); }
+  };
+  window.arihaRefreshUnitStepMainPanel = async function(){ await ensureWorkflowLoaded(); window.arihaRenderUnitStepMainPanel(); window.renderTaskWorkflowBox && window.renderTaskWorkflowBox(); };
+
+  window.renderTaskWorkflowBox = function(){
+    const box=$id('taskWorkflowBox'); if(!box) return;
+    const steps=currentVisibleSteps();
+    if(!steps.length){ box.innerHTML = `<div class="readonly-note">Chưa có bước quy trình hoặc bạn chưa có quyền xem bước nào. Nếu bạn là Manager đơn vị phối hợp, kiểm tra cột ResponsibleUnit/StepManagerUnit trong TaskWorkflowSteps có đúng <b>${esc(meUnit())}</b> không.</div>`; return; }
+    box.innerHTML = `<div class="task-pro-section"><h3>Giao việc hỗ trợ theo bước quy trình</h3><div class="hint">Manager giao Main cho bước thuộc đơn vị. Main của bước giao Support, theo dõi tiến độ, cập nhật tiến độ chung và đánh giá.</div></div>` + steps.map(s => {
+      const rows=activeRowsForStep(s.StepID);
+      const main = mainRowForStep(s.StepID) || (txt(s.MainPersonID)?{SupportPersonID:s.MainPersonID, SupportPersonName:s.MainPersonName||userById(s.MainPersonID).FullName, AssignmentRole:'Main'}:null);
+      const supports=rows.filter(r => roleOf(r.AssignmentRole||r.StepRole||r.Role) !== 'Main');
+      const canMain=canAssignMain(s), canSup=canAssignSupport(s), canFinal=canFinalEval(s);
+      const avg=rows.length?Math.round(rows.reduce((a,b)=>a+Number(b.Progress||0),0)/rows.length):Number(s.Progress||0)||0;
+      return `<div class="workflow-step-card pro"><div class="workflow-step-head"><div><span class="workflow-step-no">${esc(s.StepNo||s.StepOrder||'')}</span><b>${esc(s.StepName||'Bước quy trình')}</b><div class="muted">${esc(s.Description||'')}</div><div class="muted"><b>Đơn vị phụ trách:</b> ${esc(stepUnit(s)||'Chưa gán')} · <b>Vai trò của bạn:</b> ${esc(currentRoleForStep(s))}</div></div><div><span class="pill ${avg>=100?'st-ok':main?'st-run':'st-warn'}">${main?'Đã có Main':'Chờ Main'}</span></div></div>
+      <div class="step-participants">${main?`<div class="step-person-card main"><b>${esc(main.SupportPersonName||main.SupportPersonID)}</b><div><span class="pill st-main-assign">Người chính</span></div><div class="muted">Tiến độ bước: ${avg}%</div></div>`:''}${supports.map(x=>`<div class="step-person-card"><b>${esc(x.SupportPersonName||x.SupportPersonID)}</b><div><span class="pill st-support-assign">Hỗ trợ</span></div><div class="muted">Tiến độ: ${Number(x.Progress||0)}% · ${esc(x.Status||'')}</div></div>`).join('') || (!main?'<div class="muted">Chưa có người tham gia bước này.</div>':'')}</div>
+      <div class="step-role-grid" style="margin-top:12px"><div><label>Người thực hiện chính của bước</label>${canMain?`<select id="wfMain_${esc(s.StepID)}"><option value="">Chọn người chính</option>${userOptions(main?[main.SupportPersonID]:[], stepUnit(s))}</select>`:`<div class="readonly-note">${main?esc(main.SupportPersonName||main.SupportPersonID):'Chờ Manager đơn vị phân công'}</div>`}</div><div><label>Người hỗ trợ bước</label>${canSup?`<select multiple id="wfPerson_${esc(s.StepID)}">${userOptions(supports.map(x=>x.SupportPersonID),'')}</select>`:`<div class="readonly-note">${supports.length?supports.map(x=>esc(x.SupportPersonName||x.SupportPersonID)).join('<br>'):'Chưa có'}</div>`}</div><div><label>Hạn</label><input ${canMain||canSup?'':'disabled'} id="wfDue_${esc(s.StepID)}" type="date" value="${esc((main&&main.DueDate)||(supports[0]&&supports[0].DueDate)||s.DueDate||'')}"></div><div class="full" style="display:flex;gap:8px;flex-wrap:wrap">${(canMain||canSup)?`<button class="btn" onclick="assignWorkflowStepPro('${esc(s.StepID)}')">Lưu phân công bước</button>`:'<div class="readonly-note">Bạn chỉ có quyền xem bước này.</div>'}${rows.map(x=>`<button class="btn secondary" onclick="openWorkflowStepEvaluation('${esc(x.SupportTaskID)}')">Đánh giá ${esc(x.SupportPersonName||'')}</button>`).join(' ')}${canFinal?`<button class="btn" onclick="openWorkflowStepFinalEvaluation('${esc(s.StepID)}')">Manager chốt đánh giá bước</button>`:''}</div></div></div>`;
+    }).join('') + (steps.some(s=>canAssignMain(s)||canAssignSupport(s)) ? '<div class="workflow-batchbar"><b>Lưu nhanh toàn bộ bước đang có quyền</b><button class="btn" onclick="batchAssignWorkflowStepsPro()">Lưu toàn bộ phân công</button></div>' : '');
+  };
+
+  window.applyTaskModalRolePermissions = function(){
+    const steps=arr(wf().steps);
+    const hasManager=steps.some(canAssignMain), hasMain=steps.some(isMainOfStep), hasSupport=steps.some(isSupportOfStep);
+    const tabAssign=$id('tabSupportAssign'), tabReport=$id('tabSupportReport'), note=$id('taskRoleNotice') || (function(){ const tabs=document.querySelector('#taskModal .tabs'); if(!tabs) return null; const n=document.createElement('div'); n.id='taskRoleNotice'; n.className='readonly-note'; tabs.insertAdjacentElement('afterend', n); return n; })();
+    if(tabAssign) tabAssign.style.display = (hasManager || hasMain) ? '' : 'none';
+    if(tabReport) tabReport.style.display = (hasManager || hasMain || hasSupport) ? '' : 'none';
+    const tabEval=document.querySelector("button[onclick*=\"showTaskTab('eval'\"]"); if(tabEval) tabEval.style.display = (hasManager || hasMain || hasSupport || isAdminLeader()) ? '' : 'none';
+    if(note){ note.style.display='block'; note.innerHTML = hasManager ? `Bạn là <b>Manager đơn vị ${esc(meUnit())}</b>: được phân công Main cho bước thuộc đơn vị, theo dõi và chốt đánh giá.` : (hasMain ? 'Bạn là <b>người thực hiện chính của bước</b>: được giao Support, cập nhật tiến độ chung và đánh giá.' : (hasSupport ? 'Bạn là <b>người hỗ trợ</b>: cập nhật phần việc tại “Việc hỗ trợ của tôi” và đánh giá chéo.' : 'Bạn đang ở chế độ xem.')); }
+    window.arihaRenderUnitStepMainPanel && window.arihaRenderUnitStepMainPanel();
+  };
+
+  const oldLoadTaskWorkflow=window.loadTaskWorkflow;
+  window.loadTaskWorkflow = async function(id){ const data = oldLoadTaskWorkflow ? await oldLoadTaskWorkflow.apply(this, arguments) : await api('listTaskWorkflow',{taskId:id}); window.taskWorkflow={steps:data.steps||[],supportTasks:data.supportTasks||[],participantMatrix:data.participantMatrix||[]}; setTimeout(()=>{ try{ window.applyTaskModalRolePermissions(); window.arihaRenderUnitStepMainPanel(); window.renderTaskWorkflowBox(); }catch(e){console.warn(e);} },20); return data; };
+  const oldOpenTaskById=window.openTaskById;
+  if(oldOpenTaskById){ window.openTaskById = async function(id){ const ret = oldOpenTaskById.apply(this, arguments); setTimeout(()=>{ ensureWorkflowLoaded().then(()=>{ try{ window.applyTaskModalRolePermissions(); window.arihaRenderUnitStepMainPanel(); }catch(e){} }); },200); return ret; }; }
+  const oldShowTaskTab=window.showTaskTab;
+  window.showTaskTab=function(p,btn){ const ret=oldShowTaskTab?oldShowTaskTab.apply(this, arguments):undefined; setTimeout(()=>{ try{ if(p==='supportAssign') window.renderTaskWorkflowBox(); window.applyTaskModalRolePermissions(); window.arihaRenderUnitStepMainPanel(); }catch(e){} },50); return ret; };
+})();
+</script>
+
+
+<style>
+/* ==== PATCH 2026-05-11C: step support self-fallback + compact status line ==== */
+.ariha-step-status-line{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;padding:10px;margin:10px 0}
+.ariha-step-status-line b{color:#1e3a8a}.ariha-step-status-line .mini-progress{min-width:140px;height:9px;background:#e2e8f0;border-radius:999px;overflow:hidden}.ariha-step-status-line .mini-progress span{display:block;height:100%;background:#1e3a8a}.ariha-step-list{margin-top:5px;color:#475569;font-size:12px;line-height:1.35}.ariha-self-note{background:#fff7ed;border:1px solid #fed7aa;color:#9a3412;border-radius:12px;padding:8px;margin-top:8px;font-weight:700}
+</style>
+<script>
+/* ==== PATCH 2026-05-11C: MAIN STEP SUPPORT FLOW STABILIZER
+   - Fix "Không tìm thấy bước" by resolving StepID/WorkflowStepID/TemplateStepID.
+   - If Main does not select Support, system creates a self-support assignment for Main.
+   - Support options are restricted to Main person's unit.
+   - Status block shows Main name + role + progress in one row.
+   - Task list displays which steps each Main is assigned to when backend provides summaries.
+*/
+(function(){
+  const $id = id => document.getElementById(id);
+  const txt = v => String(v == null ? '' : v).trim();
+  const low = v => txt(v).toLowerCase();
+  const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const arr = v => Array.isArray(v) ? v : [];
+  const meId = () => txt(window.me && window.me.UserID);
+  const meRole = () => txt(window.me && window.me.Role);
+  const meUnit = () => txt((window.me && (window.me.Unit || window.me.Department || window.me.DepartmentName)) || '');
+  const same = (a,b) => !!txt(a) && low(a) === low(b);
+  const isAdminLeader = () => ['Admin','Leader'].includes(meRole());
+  const isManager = () => meRole() === 'Manager';
+  const roleOf = r => /main|chính|chinh/i.test(txt(r)) ? 'Main' : (/support|hỗ trợ|ho tro/i.test(txt(r)) ? 'Support' : txt(r));
+  const stepIdOf = s => txt(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID));
+  const stepUnit = s => txt(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit));
+  const taskId = () => txt(($id('TaskID')||{}).value || (window.currentTask && window.currentTask.TaskID));
+  const wf = () => window.taskWorkflow || {steps:[], supportTasks:[]};
+  function userById(id){ return arr(window.users || window.allUsers || []).find(u => txt(u.UserID) === txt(id) || txt(u.Email) === txt(id)) || {}; }
+  function userName(id){ const u=userById(id); return u.FullName || u.Name || id || ''; }
+  function userUnit(id){ const u=userById(id); return txt(u.Unit || u.Department || u.DepartmentName); }
+  function activeRowsForStep(stepId){ const sid=txt(stepId); return arr(wf().supportTasks).filter(r => txt(r.WorkflowStepID || r.StepID || r.StepInstanceID || r.TemplateStepID) === sid && low(r.IsActive) !== 'false'); }
+  function findStep(stepId){ const sid=txt(stepId); return arr(wf().steps).find(s => [s.StepID,s.WorkflowStepID,s.StepInstanceID,s.TemplateStepID].some(x => txt(x) === sid)); }
+  function mainRowForStep(step){ const sid=stepIdOf(step); return activeRowsForStep(sid).find(r => roleOf(r.AssignmentRole || r.StepRole || r.Role) === 'Main') || null; }
+  function mainInfoForStep(step){ const row=mainRowForStep(step); if(row) return {id:txt(row.SupportPersonID), name:txt(row.SupportPersonName)||userName(row.SupportPersonID), unit:txt(row.Unit)||userUnit(row.SupportPersonID)}; const id=txt(step&&step.MainPersonID); return id ? {id, name:txt(step.MainPersonName)||userName(id), unit:userUnit(id)||stepUnit(step)} : null; }
+  function isMainOfStep(step){ const m=mainInfoForStep(step); return !!m && txt(m.id) === meId(); }
+  function isSupportOfStep(step){ return activeRowsForStep(stepIdOf(step)).some(r => txt(r.SupportPersonID) === meId() && roleOf(r.AssignmentRole || r.StepRole || r.Role) === 'Support'); }
+  function isManagerOfStep(step){ return isAdminLeader() || (isManager() && same(stepUnit(step), meUnit())); }
+  function canSeeStep(step){ return isAdminLeader() || isManagerOfStep(step) || isMainOfStep(step) || isSupportOfStep(step) || step.CanViewStep === true; }
+  function canAssignMain(step){ return isAdminLeader() || (isManager() && same(stepUnit(step), meUnit())) || step.CanAssignMain === true; }
+  function canAssignSupport(step){ return canAssignMain(step) || isMainOfStep(step) || step.CanAssignSupport === true; }
+  function canFinalEval(step){ return canAssignMain(step) || step.CanFinalEvaluate === true; }
+  function currentRoleForStep(step){ if(canAssignMain(step)) return 'Manager'; if(isMainOfStep(step)) return 'Main'; if(isSupportOfStep(step)) return 'Support'; return 'Viewer'; }
+  function optionUsers(selectedIds, unit, excludeIds){
+    const selected=arr(selectedIds).map(String); const exclude={}; arr(excludeIds).forEach(x=>exclude[txt(x)]=true);
+    let pool=arr(window.users || window.allUsers || []).filter(u => low(u.IsActive) !== 'false');
+    if(unit) pool=pool.filter(u => same(u.Unit || u.Department || u.DepartmentName, unit));
+    return pool.filter(u=>!exclude[txt(u.UserID)]).map(u=>`<option value="${esc(u.UserID)}" ${selected.includes(String(u.UserID))?'selected':''}>${esc(u.FullName || u.UserID)} (${esc(u.Unit || u.Department || '')})</option>`).join('');
+  }
+  function currentVisibleSteps(){ return arr(wf().steps).filter(canSeeStep); }
+
+  // Improve task list detail: show assigned Main by workflow steps when available from backend.
+  const oldRenderTasks = window.renderTasksNow || window.__arihaRenderTasksUnitPatch || window.renderTasks;
+  window.__arihaRenderTasksUnitPatch = function(){
+    const tbody=$id('taskRows'); if(!tbody || !Array.isArray(window.tasks)) return oldRenderTasks && oldRenderTasks();
+    const q=($id('q')?.value||'').toLowerCase(), fg=$id('filterGroup')?.value||'Tất cả', fs=$id('filterStatus')?.value||'Tất cả';
+    const filtered=window.tasks.filter(t => (fg==='Tất cả'||t.TaskGroup===fg) && (fs==='Tất cả'||t.Status===fs) && JSON.stringify(t||{}).toLowerCase().includes(q));
+    tbody.innerHTML = filtered.map((t,idx)=>{
+      const scope=t.CurrentUserTaskScope||''; const pending=Number(t.CurrentUserUnitPendingMainCount||0); const pct=Math.max(0,Math.min(100,Number(t.Progress||0)));
+      const scopeHtml = scope==='Coordination'?`<span class="pill st-support-assign">Nhiệm vụ phối hợp · ${esc(t.CurrentUserUnitStepCount||0)} bước ${esc(meUnit())}</span>`:(scope==='PrimaryUnit'?'<span class="pill st-main-assign">Đơn vị phụ trách chính</span>':'');
+      const pendingHtml = pending>0?`<div class="muted"><b style="color:#b45309">Cần phân công Main: ${pending} bước</b></div>`:'';
+      const mainSummary = t.UnitMainStepSummary || t.MainStepSummary || t.UnitMainNames || t.MainPersonName || 'Chưa phân công';
+      const supportSummary = t.UnitSupportStepSummary || t.UnitSupportNames || t.SupportNames || 'Chưa phân công';
+      const statusCls=/hoàn thành/i.test(t.Status||'')?'st-ok':(/chậm|quá hạn/i.test(t.Status||'')?'st-risk':'st-run');
+      return `<tr><td data-label="STT"><b>${idx+1}</b></td><td data-label="Nhiệm vụ" style="min-width:320px"><b>${esc(t.TaskName)}</b><div class="muted">${esc(t.TaskGroup||'')} · Tạo bởi: ${esc(t.CreatedByName||t.CreatorName||'')}</div>${scopeHtml}${pendingHtml}</td><td data-label="Người chính / hỗ trợ"><b>Thực hiện:</b><div class="ariha-step-list">${esc(mainSummary).replace(/; /g,'<br>')}</div><span class="muted"><b>Hỗ trợ:</b></span><div class="ariha-step-list">${esc(supportSummary).replace(/; /g,'<br>')}</div></td><td data-label="KPI">${esc(t.KPIText||t.KPI||'')}</td><td data-label="Deadline">${esc(t.DueDate||t.Deadline||'')}</td><td data-label="Tiến độ"><div class="progress"><div class="bar" style="width:${pct}%"></div></div><div class="muted">${pct}%</div></td><td data-label="Trạng thái"><span class="pill ${statusCls}">${esc(t.Status||'')}</span></td><td data-label="Xếp loại cuối">${esc(t.FinalStatus||t.LeaderFinalRating||t.ManagerRating||'Chưa đánh giá')}</td><td data-label="Thao tác"><button class="btn secondary" onclick="openTaskById('${esc(t.TaskID)}')">Mở</button></td></tr>`;
+    }).join('') || '<tr><td colspan="9"><div class="muted">Không có nhiệm vụ phù hợp.</div></td></tr>';
+    return true;
+  };
+  window.renderTasksNow = window.__arihaRenderTasksUnitPatch;
+  window.renderTasks = function(){ if(window.__renderTimer) cancelAnimationFrame(window.__renderTimer); window.__renderTimer=requestAnimationFrame(()=>window.__arihaRenderTasksUnitPatch()); };
+
+  window.renderTaskWorkflowBox = function(){
+    const box=$id('taskWorkflowBox'); if(!box) return;
+    const steps=currentVisibleSteps();
+    if(!steps.length){ box.innerHTML = `<div class="readonly-note">Chưa có bước quy trình hoặc bạn chưa có quyền xem bước nào. Kiểm tra ResponsibleUnit/StepManagerUnit và MainPersonID trong TaskWorkflowSteps.</div>`; return; }
+    box.innerHTML = `<div class="task-pro-section"><h3>Giao việc hỗ trợ theo bước quy trình</h3><div class="hint">Nếu Main không chọn người hỗ trợ, hệ thống mặc định Main tự thực hiện phần việc của bước. Danh sách hỗ trợ chỉ lấy nhân sự cùng đơn vị với Main của bước.</div></div>` + steps.map(s=>{
+      const sid=stepIdOf(s); const rows=activeRowsForStep(sid); const main=mainInfoForStep(s); const supports=rows.filter(r => roleOf(r.AssignmentRole||r.StepRole||r.Role) !== 'Main');
+      const canMain=canAssignMain(s), canSup=canAssignSupport(s), canFinal=canFinalEval(s); const progress=Number(s.Progress||0)||Math.round((rows.reduce((a,b)=>a+Number(b.Progress||0),0))/(rows.length||1));
+      const mainUnit=(main&&main.unit)||stepUnit(s); const supportSelected=supports.map(x=>x.SupportPersonID).filter(id=>txt(id)!==txt(main&&main.id));
+      const line = main ? `<div class="ariha-step-status-line"><b>${esc(main.name)}</b><span class="pill st-main-assign">Người chính</span><span>${progress}%</span><div class="mini-progress"><span style="width:${Math.max(0,Math.min(100,progress))}%"></span></div></div>` : '<div class="ariha-self-note">Chưa có Main. Manager đơn vị phụ trách bước cần phân công người thực hiện chính.</div>';
+      const supportNote = canSup ? '<div class="ariha-self-note">Không chọn người hỗ trợ = Main tự thực hiện bước này.</div>' : '';
+      return `<div class="workflow-step-card pro"><div class="workflow-step-head"><div><span class="workflow-step-no">${esc(s.StepNo||s.StepOrder||'')}</span><b>${esc(s.StepName||'Bước quy trình')}</b><div class="muted">${esc(s.Description||'')}</div><div class="muted"><b>Đơn vị phụ trách:</b> ${esc(stepUnit(s)||'Chưa gán')} · <b>Vai trò của bạn:</b> ${esc(currentRoleForStep(s))}</div></div><div><span class="pill ${progress>=100?'st-ok':main?'st-run':'st-warn'}">${main?'Đã có Main':'Chờ Main'}</span></div></div>${line}
+      <div class="step-participants">${supports.map(x=>`<div class="step-person-card"><div class="ariha-step-status-line"><b>${esc(x.SupportPersonName||x.SupportPersonID)}</b><span class="pill st-support-assign">Hỗ trợ</span><span>${Number(x.Progress||0)}%</span><div class="mini-progress"><span style="width:${Math.max(0,Math.min(100,Number(x.Progress||0)))}%"></span></div></div><div class="muted">${esc(x.Status||'')}</div></div>`).join('') || '<div class="muted">Chưa giao người hỗ trợ riêng.</div>'}</div>
+      <div class="step-role-grid" style="margin-top:12px"><div><label>Người thực hiện chính của bước</label>${canMain?`<select id="wfMain_${esc(sid)}"><option value="">Chọn người chính</option>${optionUsers(main?[main.id]:[], stepUnit(s), [])}</select>`:`<div class="readonly-note">${main?esc(main.name):'Chờ Manager đơn vị phân công'}</div>`}</div><div><label>Người hỗ trợ bước</label>${canSup?`<select multiple id="wfPerson_${esc(sid)}">${optionUsers(supportSelected, mainUnit, main?[main.id]:[])}</select>${supportNote}`:`<div class="readonly-note">${supports.length?supports.map(x=>esc(x.SupportPersonName||x.SupportPersonID)).join('<br>'):'Chưa có'}</div>`}</div><div><label>Hạn</label><input ${canMain||canSup?'':'disabled'} id="wfDue_${esc(sid)}" type="date" value="${esc((supports[0]&&supports[0].DueDate)||s.DueDate||'')}"></div><div class="full" style="display:flex;gap:8px;flex-wrap:wrap">${(canMain||canSup)?`<button class="btn" onclick="assignWorkflowStepPro('${esc(sid)}')">Lưu phân công bước</button>`:'<div class="readonly-note">Bạn chỉ có quyền xem bước này.</div>'}${rows.map(x=>`<button class="btn secondary" onclick="openWorkflowStepEvaluation('${esc(x.SupportTaskID)}')">Đánh giá ${esc(x.SupportPersonName||'')}</button>`).join(' ')}${canFinal?`<button class="btn" onclick="openWorkflowStepFinalEvaluation('${esc(sid)}')">Manager chốt đánh giá bước</button>`:''}</div></div></div>`;
+    }).join('') + (steps.some(s=>canAssignMain(s)||canAssignSupport(s)) ? '<div class="workflow-batchbar"><b>Lưu nhanh toàn bộ bước đang có quyền</b><button class="btn" onclick="batchAssignWorkflowStepsPro()">Lưu toàn bộ phân công</button></div>' : '');
+  };
+
+  window.assignWorkflowStepPro = async function(stepId){
+    const step=findStep(stepId); if(!step) return alert('Không tìm thấy bước. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ.');
+    const sid=stepIdOf(step); const main=mainInfoForStep(step); const mainEl=$id('wfMain_'+sid); const supportEl=$id('wfPerson_'+sid); const due=($id('wfDue_'+sid)||{}).value||''; const payload=[];
+    if(mainEl && mainEl.value) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainEl.value,DueDate:due,AssignmentRole:'Main',StepRole:'Main'});
+    const selected=supportEl?Array.from(supportEl.selectedOptions||[]).map(o=>o.value).filter(Boolean):[];
+    selected.filter(uid=>txt(uid)!==txt((mainEl&&mainEl.value)||(main&&main.id))).forEach(uid=>payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support'}));
+    if(!selected.length && !mainEl && main && txt(main.id)===meId()) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:main.id,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:'Main tự thực hiện phần việc của bước'});
+    if(!payload.length) return alert('Chưa có phân công mới để lưu. Nếu không giao hỗ trợ, Main sẽ tự thực hiện bước này.');
+    try{ await api(payload.length>1?'batchAssignWorkflowSteps':'assignWorkflowStep', payload.length>1?{assignments:payload}:{assignment:payload[0]}); alert('Đã lưu phân công bước.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+  };
+
+  window.batchAssignWorkflowStepsPro = async function(){
+    const steps=currentVisibleSteps().filter(s=>canAssignMain(s)||canAssignSupport(s)); const payload=[];
+    steps.forEach(s=>{ const sid=stepIdOf(s), main=mainInfoForStep(s), mainEl=$id('wfMain_'+sid), supportEl=$id('wfPerson_'+sid), due=($id('wfDue_'+sid)||{}).value||''; if(mainEl&&mainEl.value) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainEl.value,DueDate:due,AssignmentRole:'Main',StepRole:'Main'}); const selected=supportEl?Array.from(supportEl.selectedOptions||[]).map(o=>o.value).filter(Boolean):[]; selected.filter(uid=>txt(uid)!==txt((mainEl&&mainEl.value)||(main&&main.id))).forEach(uid=>payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support'})); if(!selected.length && !mainEl && main && txt(main.id)===meId()) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:main.id,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:'Main tự thực hiện phần việc của bước'}); });
+    if(!payload.length) return alert('Chưa có phân công mới để lưu.');
+    try{ await api('batchAssignWorkflowSteps',{assignments:payload}); alert('Đã lưu toàn bộ phân công.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+  };
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v92: minimized support assignment per step + self fallback batch save ==== */
+(function(){
+  const $id = id => document.getElementById(id);
+  const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const txt = v => String(v == null ? '' : v).trim();
+  const low = v => txt(v).toLowerCase();
+  const arr = v => Array.isArray(v) ? v : [];
+  const me = () => window.me || window.currentUser || {};
+  const meId = () => txt(me().UserID || me().Email);
+  const meRole = () => txt(me().Role);
+  const meUnit = () => txt(me().Unit || me().Department || me().DepartmentName);
+  const same = (a,b) => !!txt(a) && low(a) === low(b);
+  const isAdminLeader = () => ['Admin','Leader'].includes(meRole());
+  const isManager = () => meRole() === 'Manager';
+  const taskId = () => txt(($id('TaskID')||{}).value || (window.currentTask||{}).TaskID);
+  const wf = () => window.taskWorkflow || {steps:[], supportTasks:[]};
+  const sidOf = s => txt(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID));
+  const sidOfRow = r => txt(r && (r.WorkflowStepID || r.StepID || r.StepInstanceID || r.TemplateStepID));
+  const stepUnit = s => txt(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit));
+  const isMainRole = r => /main|chính|chinh/i.test(txt(r));
+  function userById(id){ return arr(window.users || window.allUsers || []).find(u => txt(u.UserID)===txt(id) || txt(u.Email)===txt(id)) || {}; }
+  function userName(id){ const u=userById(id); return u.FullName || u.Name || id || ''; }
+  function userUnit(id){ const u=userById(id); return txt(u.Unit || u.Department || u.DepartmentName); }
+  function rowsForStep(sid){ sid=txt(sid); return arr(wf().supportTasks).filter(r => sidOfRow(r)===sid && low(r.IsActive)!=='false'); }
+  function findStepAny(key){ key=txt(key); return arr(wf().steps).find(s => [s.StepID,s.WorkflowStepID,s.StepInstanceID,s.TemplateStepID].some(x => txt(x)===key)); }
+  function mainRow(step){ return rowsForStep(sidOf(step)).find(r => isMainRole(r.AssignmentRole || r.StepRole || r.Role)) || null; }
+  function mainInfo(step){ const r=mainRow(step); if(r) return {id:txt(r.SupportPersonID), name:txt(r.SupportPersonName)||userName(r.SupportPersonID), unit:txt(r.Unit)||userUnit(r.SupportPersonID)||stepUnit(step)}; const id=txt(step&&step.MainPersonID); return id ? {id, name:txt(step.MainPersonName)||userName(id), unit:userUnit(id)||stepUnit(step)} : null; }
+  function isMainOf(step){ const m=mainInfo(step); return !!m && txt(m.id)===meId(); }
+  function isSupportOf(step){ return rowsForStep(sidOf(step)).some(r => txt(r.SupportPersonID)===meId() && !isMainRole(r.AssignmentRole || r.StepRole || r.Role)); }
+  function isManagerOf(step){ return isAdminLeader() || (isManager() && same(stepUnit(step), meUnit())); }
+  function canSee(step){ return isAdminLeader() || isManagerOf(step) || isMainOf(step) || isSupportOf(step) || step.CanViewStep === true; }
+  function canAssignMain(step){ return isAdminLeader() || isManagerOf(step) || step.CanAssignMain === true; }
+  function canAssignSupport(step){ return canAssignMain(step) || isMainOf(step) || step.CanAssignSupport === true; }
+  function roleFor(step){ if(canAssignMain(step)) return 'Manager'; if(isMainOf(step)) return 'Main'; if(isSupportOf(step)) return 'Support'; return 'Viewer'; }
+  function optionStaffSameUnit(selectedIds, unit, excludeIds){
+    const selected = arr(selectedIds).map(String); const exclude = {}; arr(excludeIds).forEach(x => exclude[txt(x)] = true);
+    let pool = arr(window.users || window.allUsers || []).filter(u => low(u.IsActive) !== 'false');
+    pool = pool.filter(u => same(u.Unit || u.Department || u.DepartmentName, unit));
+    pool = pool.filter(u => txt(u.Role || 'Staff') === 'Staff');
+    return pool.filter(u => !exclude[txt(u.UserID)]).map(u => `<option value="${esc(u.UserID)}" ${selected.includes(String(u.UserID))?'selected':''}>${esc(u.FullName || u.UserID)} (${esc(u.Unit || u.Department || '')})</option>`).join('');
+  }
+  function visibleSteps(){ return arr(wf().steps).filter(canSee); }
+  function supportRows(step){ return rowsForStep(sidOf(step)).filter(r => !isMainRole(r.AssignmentRole || r.StepRole || r.Role)); }
+  function progressOf(step){ const rows=rowsForStep(sidOf(step)); const p=Number(step.Progress||0); if(p) return Math.max(0, Math.min(100, p)); if(rows.length) return Math.round(rows.reduce((a,b)=>a+Number(b.Progress||0),0)/rows.length); return 0; }
+  window.arihaToggleStepSupportPicker = function(sid){ const el=$id('arihaSupportPicker_'+sid); if(el) el.style.display = (el.style.display==='none' || !el.style.display) ? 'block' : 'none'; };
+  window.renderTaskWorkflowBox = function(){
+    const box=$id('taskWorkflowBox'); if(!box) return;
+    const steps=visibleSteps();
+    if(!steps.length){ box.innerHTML = `<div class="readonly-note">Chưa có bước quy trình hoặc bạn chưa có quyền xem bước nào. Kiểm tra TaskWorkflowSteps/ResponsibleUnit/MainPersonID.</div>`; return; }
+    box.innerHTML = `<div class="task-pro-section"><h3>Giao việc hỗ trợ theo bước quy trình</h3><div class="hint">Mỗi bước đang thu gọn. Bấm <b>Chọn người hỗ trợ</b> để mở danh sách Staff cùng đơn vị với Main. Không chọn người hỗ trợ thì Main tự thực hiện phần việc của bước khi bấm <b>Lưu toàn bộ phân công</b>.</div></div>` +
+      steps.map(s => {
+        const sid=sidOf(s); const main=mainInfo(s); const supports=supportRows(s); const p=progressOf(s); const canMain=canAssignMain(s); const canSup=canAssignSupport(s); const mainUnit=(main&&main.unit)||stepUnit(s);
+        const selected=supports.map(r=>txt(r.SupportPersonID)).filter(id => !main || txt(id)!==txt(main.id));
+        const compact = main ? `<div class="ariha-step-status-line" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#f8fafc;border:1px solid #dbeafe;border-radius:14px;padding:10px;margin-top:10px"><b style="color:#1e3a8a">${esc(main.name)}</b><span class="pill st-main-assign">Người chính</span><span>${p}%</span><div class="progress" style="width:130px"><div class="bar" style="width:${p}%"></div></div></div>` : `<div class="readonly-note" style="margin-top:10px">Chưa có Main. Manager đơn vị phụ trách bước cần phân công người thực hiện chính.</div>`;
+        const picker = canSup ? `<button class="btn secondary" onclick="arihaToggleStepSupportPicker('${esc(sid)}')">Chọn người hỗ trợ</button>` : '';
+        const pickerBox = canSup ? `<div id="arihaSupportPicker_${esc(sid)}" class="ariha-support-picker" style="display:none;margin-top:12px;background:#fff;border:1px dashed #93c5fd;border-radius:14px;padding:12px"><label>Người hỗ trợ bước <span class="muted">(chỉ Staff cùng đơn vị ${esc(mainUnit||'')})</span></label><select multiple id="wfPerson_${esc(sid)}" style="min-height:96px">${optionStaffSameUnit(selected, mainUnit, main?[main.id]:[])}</select><div class="ariha-self-note" style="margin-top:8px">Không chọn người hỗ trợ = Main tự thực hiện bước này.</div><div style="display:grid;grid-template-columns:1fr 160px;gap:10px;margin-top:10px"><div><label>Nội dung hỗ trợ</label><input id="wfContent_${esc(sid)}" value="${esc('Hỗ trợ: '+(s.StepName||'bước quy trình'))}"></div><div><label>Hạn</label><input id="wfDue_${esc(sid)}" type="date" value="${esc(s.DueDate||'')}"></div></div></div>` : '';
+        const mainAssign = canMain && !main ? `<div style="margin-top:12px"><label>Người thực hiện chính của bước</label><select id="wfMain_${esc(sid)}"><option value="">Chọn người chính</option>${optionStaffSameUnit([], stepUnit(s), [])}</select></div>` : '';
+        return `<div class="workflow-step-card pro" data-step-id="${esc(sid)}"><div class="workflow-step-head"><div><span class="workflow-step-no">${esc(s.StepNo||s.StepOrder||'')}</span><b>${esc(s.StepName||'Bước quy trình')}</b><div class="muted">${esc(s.Description||'')}</div><div class="muted"><b>Đơn vị phụ trách:</b> ${esc(stepUnit(s)||'Chưa gán')} · <b>Vai trò của bạn:</b> ${esc(roleFor(s))}</div></div><div><span class="pill ${main?'st-run':'st-warn'}">${main?'Đã có Main':'Chờ Main'}</span></div></div>${compact}<div class="muted" style="margin-top:8px">${supports.length ? 'Hỗ trợ: '+supports.map(r=>esc(r.SupportPersonName||userName(r.SupportPersonID)||r.SupportPersonID)).join(', ') : 'Chưa giao người hỗ trợ riêng.'}</div>${mainAssign}<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">${picker}${canSup?`<button class="btn secondary" onclick="assignWorkflowStepPro('${esc(sid)}')">Lưu bước này</button>`:''}${rowsForStep(sid).map(r=>`<button class="btn secondary" onclick="openWorkflowStepEvaluation('${esc(r.SupportTaskID)}')">Đánh giá ${esc(r.SupportPersonName||userName(r.SupportPersonID)||'')}</button>`).join('')}</div>${pickerBox}</div>`;
+      }).join('') + (steps.some(s=>canAssignMain(s)||canAssignSupport(s)) ? `<div class="workflow-batchbar"><b>Lưu nhanh toàn bộ bước đang có quyền</b><button class="btn" onclick="batchAssignWorkflowStepsPro()">Lưu toàn bộ phân công</button></div>` : '');
+  };
+  window.assignWorkflowStepPro = async function(stepKey){
+    const step=findStepAny(stepKey); if(!step) return alert('Không tìm thấy bước. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ.');
+    const sid=sidOf(step), main=mainInfo(step), mainEl=$id('wfMain_'+sid), supportEl=$id('wfPerson_'+sid), due=($id('wfDue_'+sid)||{}).value||'', content=($id('wfContent_'+sid)||{}).value||''; const payload=[];
+    if(mainEl && mainEl.value) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainEl.value,DueDate:due,AssignmentRole:'Main',StepRole:'Main',Content:'Người thực hiện chính của bước'});
+    const selected=supportEl?Array.from(supportEl.selectedOptions||[]).map(o=>o.value).filter(Boolean):[];
+    selected.filter(uid=>!main || txt(uid)!==txt(main.id)).forEach(uid=>payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:content||('Hỗ trợ: '+(step.StepName||'bước quy trình'))}));
+    if(!selected.length && main && txt(main.id)===meId()) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:main.id,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:'Main tự thực hiện phần việc của bước'});
+    if(!payload.length) return alert('Chưa có phân công mới để lưu.');
+    try{ await api(payload.length>1?'batchAssignWorkflowSteps':'assignWorkflowStep', payload.length>1?{assignments:payload}:{assignment:payload[0]}); alert('Đã lưu phân công bước.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+  };
+  window.batchAssignWorkflowStepsPro = async function(){
+    const steps=visibleSteps().filter(s=>canAssignMain(s)||canAssignSupport(s)); const payload=[];
+    steps.forEach(s=>{ const sid=sidOf(s), main=mainInfo(s), mainEl=$id('wfMain_'+sid), supportEl=$id('wfPerson_'+sid), due=($id('wfDue_'+sid)||{}).value||'', content=($id('wfContent_'+sid)||{}).value||''; if(mainEl&&mainEl.value) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainEl.value,DueDate:due,AssignmentRole:'Main',StepRole:'Main',Content:'Người thực hiện chính của bước'}); const selected=supportEl?Array.from(supportEl.selectedOptions||[]).map(o=>o.value).filter(Boolean):[]; selected.filter(uid=>!main || txt(uid)!==txt(main.id)).forEach(uid=>payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:content||('Hỗ trợ: '+(s.StepName||'bước quy trình'))})); if(!selected.length && main && txt(main.id)===meId()) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:main.id,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:'Main tự thực hiện phần việc của bước'}); });
+    if(!payload.length) return alert('Chưa có phân công mới để lưu.');
+    try{ await api('batchAssignWorkflowSteps',{assignments:payload}); alert('Đã lưu toàn bộ phân công.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+  };
+})();
+</script>
+
+
+<script>
+/* ==== PATCH v94: Deduplicate support update context by workflow step ==== */
+(function(){
+  function _txt(v){ return String(v == null ? '' : v).trim(); }
+  function _esc(v){ try{ return typeof esc === 'function' ? esc(v) : String(v == null ? '' : v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); }catch(e){ return String(v||''); } }
+  function _fmt(v){ try{ return typeof fmtDate === 'function' ? fmtDate(v) : (v || ''); }catch(e){ return v || ''; } }
+  function _statusClass(r){ try{ return typeof supportContextStatusClass_ === 'function' ? supportContextStatusClass_(r) : (Number(r.Progress||0)>=100 ? 'done' : 'pending'); }catch(e){ return 'pending'; } }
+  function _chip(r){ try{ return typeof supportContextChip_ === 'function' ? supportContextChip_(r) : `<span class="support-status-chip">${_esc(r.Status||'')}</span>`; }catch(e){ return ''; } }
+  function _notes(r){ try{ return typeof supportStepNotesHtml_ === 'function' ? supportStepNotesHtml_(r) : '<div class="muted">Chưa có ghi chú/minh chứng cập nhật.</div>'; }catch(e){ return '<div class="muted">Chưa có ghi chú/minh chứng cập nhật.</div>'; } }
+  function _toggleUpdate(){ try{ if(typeof toggleMySupportUpdatePanel === 'function') toggleMySupportUpdatePanel(); }catch(e){} }
+  window.toggleMySupportUpdatePanel = window.toggleMySupportUpdatePanel || _toggleUpdate;
+
+  function stepKeyOf_(r, fallback){
+    var keys = [r && r.StepID, r && r.WorkflowStepID, r && r.StepInstanceID, r && r.TaskWorkflowStepID, r && r.TemplateStepID];
+    for(var i=0;i<keys.length;i++){ if(_txt(keys[i])) return 'ID:'+_txt(keys[i]); }
+    var no = _txt((r && (r.WorkflowStepNo || r.StepNo || r.StepOrder || r.StepIndex)) || '');
+    var name = _txt((r && (r.WorkflowStepName || r.StepName || r.Content)) || '');
+    if(no) return 'NO:'+no;
+    if(name) return 'NAME:'+name.toLowerCase();
+    return 'ROW:'+fallback;
+  }
+  function rowNo_(r, idx){ return Number(r.WorkflowStepNo || r.StepNo || r.StepOrder || r.StepIndex || idx+1); }
+  function mergeRowsByStep_(current, allSteps){
+    var currentId = _txt(current && current.SupportTaskID);
+    var rows = Array.isArray(allSteps) ? allSteps.slice() : [];
+    if(current && Object.keys(current).length && !rows.some(function(r){ return _txt(r.SupportTaskID) === currentId && currentId; })) rows.push(current);
+    var map = {}, order = [];
+    rows.forEach(function(r, idx){
+      r = r || {};
+      var key = stepKeyOf_(r, idx);
+      if(!map[key]){
+        map[key] = { base: Object.assign({}, r), items: [], key: key, firstIndex: idx };
+        order.push(key);
+      }
+      map[key].items.push(r);
+      var isCurrent = currentId && _txt(r.SupportTaskID) === currentId;
+      var base = map[key].base;
+      // Prefer the actual row being updated, otherwise prefer a row with support task data over a plain workflow-step row.
+      if(isCurrent || (!_txt(base.SupportTaskID) && _txt(r.SupportTaskID))){
+        map[key].base = Object.assign({}, base, r);
+      }
+    });
+    return order.map(function(k, idx){
+      var g = map[k], b = g.base || {};
+      var supportNames = [];
+      var supportIds = {};
+      var maxProgress = Number(b.Progress || 0);
+      var done = false;
+      var statuses = [];
+      g.items.forEach(function(x){
+        var name = _txt(x.SupportPersonName || (typeof userNameOnly === 'function' ? userNameOnly(x.SupportPersonID) : '') || x.SupportPersonID);
+        var id = _txt(x.SupportPersonID || name);
+        if(id && !supportIds[id]){ supportIds[id] = true; if(name) supportNames.push(name); }
+        var p = Number(x.Progress || 0); if(!isNaN(p)) maxProgress = Math.max(maxProgress, p);
+        if(p >= 100 || _txt(x.Status) === 'Hoàn thành') done = true;
+        if(_txt(x.Status)) statuses.push(_txt(x.Status));
+      });
+      b.__items = g.items;
+      b.__stepKey = k;
+      b.__isCurrentStep = currentId && g.items.some(function(x){ return _txt(x.SupportTaskID) === currentId; });
+      b.__supportNames = supportNames;
+      b.Progress = b.__isCurrentStep ? Number((current && current.Progress) || maxProgress || 0) : maxProgress;
+      b.Status = done ? 'Hoàn thành' : (b.Status || statuses[0] || 'Chưa bắt đầu');
+      if(!b.WorkflowStepNo && !b.StepNo) b.WorkflowStepNo = rowNo_(b, idx);
+      return b;
+    }).sort(function(a,b){ return rowNo_(a,0)-rowNo_(b,0); });
+  }
+
+  window.renderSupportStepContextHtml_ = function(current, allSteps){
+    current = current || {};
+    var currentId = _txt(current.SupportTaskID);
+    var rows = mergeRowsByStep_(current, allSteps);
+    var total = rows.length;
+    var done = rows.filter(function(r){ return Number(r.Progress||0)>=100 || r.Status==='Hoàn thành'; }).length;
+    var cur = rows.find(function(r){ return r.__isCurrentStep; }) || current;
+    var curNo = cur.WorkflowStepNo || cur.StepNo || '';
+    var listHtml = rows.map(function(r, idx){
+      var isCur = !!r.__isCurrentStep;
+      var p = Number(r.Progress || 0);
+      var detailId = 'supportStepDetail_dedup_' + String(r.__stepKey || idx).replace(/[^a-zA-Z0-9_]/g,'_');
+      var no = r.WorkflowStepNo || r.StepNo || r.StepOrder || idx+1;
+      var title = (no ? ('Bước ' + no + ' · ') : '') + (r.WorkflowStepName || r.StepName || r.Content || 'Bước quy trình');
+      var names = (r.__supportNames && r.__supportNames.length) ? r.__supportNames.join(', ') : (r.SupportPersonName || (typeof userNameOnly === 'function' ? userNameOnly(r.SupportPersonID) : '') || 'Chưa giao');
+      var allNotes = (r.__items || [r]).map(function(x){ return _notes(x); }).join('');
+      return `<div class="support-context-step ${_statusClass(r)} ${isCur?'current':''}">
+        <div class="support-context-head">
+          <span class="support-step-no-badge">${_esc(no)}</span>
+          <div>
+            <b>${_esc(title)}</b> ${isCur?'<span class="replace-badge">Đang cập nhật</span>':''}
+            <div class="muted">Người hỗ trợ: ${_esc(names)} · Hạn: ${_esc(_fmt(r.DueDate)||'')} · Tiến độ: ${p}%</div>
+            <div class="progress" style="width:180px;margin-top:6px"><div class="bar" style="width:${Math.min(Math.max(p,0),100)}%"></div></div>
+          </div>
+          <div class="support-context-actions">
+            ${_chip(r)}
+            ${isCur?'<button class="btn" type="button" onclick="toggleMySupportUpdatePanel()">Cập nhật bước này</button>':`<button class="btn secondary" type="button" onclick="toggleSupportStepDetail('${detailId}')">Xem chi tiết</button>`}
+          </div>
+        </div>
+        <div id="${detailId}" class="support-context-detail ${isCur?'show':''}">
+          <b>Nội dung bước:</b> ${_esc(r.WorkflowStepName || r.StepName || r.Content || '')}<br>
+          <b>Trạng thái:</b> ${_esc(r.Status||'')} · <b>Tiến độ:</b> ${p}% · <b>Minh chứng:</b> ${r.EvidenceUrl?`<a href="${_esc(r.EvidenceUrl)}" target="_blank">${_esc(r.EvidenceTitle||'Mở minh chứng')}</a>`:_esc(r.EvidenceTitle||'Chưa có')}
+          <div style="margin-top:8px"><b>Ghi chú / lịch sử:</b>${allNotes}</div>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="support-step-context fullflow">
+      <h3>Bối cảnh bước trong quy trình</h3>
+      <div class="muted">Mỗi bước chỉ hiển thị một block. Nếu một bước có nhiều người hỗ trợ/cập nhật, hệ thống gom trong cùng block đó.</div>
+      <div style="margin:8px 0"><b>Kết quả quy trình:</b> ${done}/${total} bước hoàn thành · Bước hiện tại: ${_esc(curNo||'-')}</div>
+      <div class="support-context-list">${listHtml}</div>
+    </div>`;
+  };
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v97: UI self-execution marker, do not send Main as SupportPersonID ==== */
+(function(){
+  function ready(fn){ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', fn); else fn(); }
+  ready(function(){
+    const txt=v=>String(v??'').trim();
+    const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    const $id=id=>document.getElementById(id);
+    const arr=x=>Array.isArray(x)?x:[];
+    const low=v=>txt(v).toLowerCase();
+    const taskId=()=>($id('TaskID')||{}).value||'';
+    function wf(){ return window.currentWorkflowData || window.taskWorkflowData || {}; }
+    function sidOf(s){ return txt(s&&(s.StepID||s.WorkflowStepID||s.StepInstanceID||s.TemplateStepID)); }
+    function stepUnit(s){ return txt(s&&(s.ResponsibleUnit||s.StepManagerUnit||s.Unit||s.StepUnit||s.HostUnit)); }
+    function isMainRole(r){ return /main|chính|chinh/i.test(txt(r)); }
+    function me(){ return window.currentUser || window.me || {}; }
+    function meId(){ return txt(me().UserID || me().Email); }
+    function same(a,b){ return low(a)===low(b) && txt(a)!==''; }
+    function userById(id){ return arr(window.users || window.allUsers || []).find(u=>txt(u.UserID)===txt(id)||txt(u.Email)===txt(id)) || {}; }
+    function userName(id){ const u=userById(id); return u.FullName||u.Name||id||''; }
+    function userUnit(id){ const u=userById(id); return txt(u.Unit||u.Department||u.DepartmentName); }
+    function sidOfRow(r){ return txt(r&&(r.WorkflowStepID||r.StepID||r.StepInstanceID||r.TemplateStepID)); }
+    function rowsForStep(sid){ return arr(wf().supportTasks).filter(r=>sidOfRow(r)===txt(sid)&&low(r.IsActive)!=='false'); }
+    function mainRow(step){ return rowsForStep(sidOf(step)).find(r=>isMainRole(r.AssignmentRole||r.StepRole||r.Role))||null; }
+    function mainInfo(step){ const r=mainRow(step); if(r) return {id:txt(r.SupportPersonID),name:txt(r.SupportPersonName)||userName(r.SupportPersonID),unit:txt(r.Unit)||userUnit(r.SupportPersonID)||stepUnit(step)}; const id=txt(step&&step.MainPersonID); return id?{id,name:txt(step.MainPersonName)||userName(id),unit:userUnit(id)||stepUnit(step)}:null; }
+    function isMainOf(step){ const m=mainInfo(step); return !!m && txt(m.id)===meId(); }
+    function isAdminLeader(){ return ['admin','leader'].includes(low(me().Role)); }
+    function isManager(){ return low(me().Role)==='manager'; }
+    function meUnit(){ return txt(me().Unit||me().Department||me().DepartmentName); }
+    function isManagerOf(step){ return isAdminLeader() || (isManager() && same(stepUnit(step),meUnit())); }
+    function canAssignSupport(step){ return isManagerOf(step)||isMainOf(step)||step.CanAssignSupport===true; }
+    function canAssignMain(step){ return isAdminLeader()||isManagerOf(step)||step.CanAssignMain===true; }
+    function findStepAny(key){ key=txt(key); return arr(wf().steps).find(s=>[s.StepID,s.WorkflowStepID,s.StepInstanceID,s.TemplateStepID].some(x=>txt(x)===key)); }
+    function visibleSteps(){ return arr(wf().steps).filter(s=>isAdminLeader()||isManagerOf(s)||isMainOf(s)||stepUnit(s)); }
+    function buildStepPayload(step, single){
+      const sid=sidOf(step), main=mainInfo(step), due=($id('wfDue_'+sid)||{}).value||'', content=($id('wfContent_'+sid)||{}).value||'';
+      const payload=[];
+      const mainEl=$id('wfMain_'+sid);
+      if(mainEl && mainEl.value) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainEl.value,DueDate:due,AssignmentRole:'Main',StepRole:'Main',Content:'Người thực hiện chính của bước'});
+      const supportEl=$id('wfPerson_'+sid);
+      const selected=supportEl?Array.from(supportEl.selectedOptions||[]).map(o=>o.value).filter(Boolean):[];
+      selected.filter(uid=>!main||txt(uid)!==txt(main.id)).forEach(uid=>payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:content||('Hỗ trợ: '+(step.StepName||'bước quy trình'))}));
+      if(!selected.length && main && canAssignSupport(step)){
+        payload.push({TaskID:taskId(),StepID:sid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',NoSupportSelected:true,SupportMode:'SELF',Content:'Main tự thực hiện phần việc của bước'});
+      }
+      return payload;
+    }
+    window.assignWorkflowStepPro = async function(stepKey){
+      const step=findStepAny(stepKey); if(!step) return alert('Không tìm thấy bước. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ.');
+      const payload=buildStepPayload(step,true);
+      if(!payload.length) return alert('Chưa có phân công mới để lưu.');
+      try{ await api(payload.length>1?'batchAssignWorkflowSteps':'assignWorkflowStep', payload.length>1?{assignments:payload}:{assignment:payload[0]}); alert('Đã lưu phân công bước.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+    };
+    window.batchAssignWorkflowStepsPro = async function(){
+      const steps=visibleSteps().filter(s=>canAssignMain(s)||canAssignSupport(s));
+      let payload=[]; steps.forEach(s=>{ payload=payload.concat(buildStepPayload(s,false)); });
+      if(!payload.length) return alert('Chưa có phân công mới để lưu.');
+      try{ await api('batchAssignWorkflowSteps',{assignments:payload}); alert('Đã lưu toàn bộ phân công. Bước không chọn hỗ trợ được ghi nhận Main tự thực hiện, không tạo dòng SupportTasks.'); if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId()); if(window.loadTasks) await loadTasks(); if(window.loadMySupportTasks) await loadMySupportTasks(true); }catch(e){ alert(e.message||e); }
+    };
+  });
+})();
+</script>
+
+
+<script>
+/* ==== PATCH v98: robust Step resolve + SELF save without SupportTask ==== */
+(function(){
+  function ready(fn){ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded', fn); else fn(); }
+  ready(function(){
+    const txt=v=>String(v??'').trim();
+    const $id=id=>document.getElementById(id);
+    const arr=x=>Array.isArray(x)?x:[];
+    const taskId=()=>($id('TaskID')||{}).value || (window.activeTask&&window.activeTask.TaskID) || '';
+    function wf(){ return window.currentWorkflowData || window.taskWorkflowData || {}; }
+    function stepKeys(s){ return [s&&s.StepID,s&&s.WorkflowStepID,s&&s.StepInstanceID,s&&s.TemplateStepID,s&&s.StepNo,s&&s.StepOrder].map(txt).filter(Boolean); }
+    function sidOf(s){ return txt(s&&(s.StepID||s.WorkflowStepID||s.StepInstanceID||s.TemplateStepID||s.StepNo||s.StepOrder)); }
+    function findStepLoose(key){
+      key=txt(key);
+      let steps=arr(wf().steps);
+      let s=steps.find(x=>stepKeys(x).includes(key));
+      if(s) return s;
+      // Fallback from DOM-rendered step card/selects; enough to save because backend resolves StepID again.
+      return key ? {StepID:key, WorkflowStepID:key, StepNo:key} : null;
+    }
+    function readSupportSelected(sid){ const el=$id('wfPerson_'+sid); return el?Array.from(el.selectedOptions||[]).map(o=>o.value).filter(Boolean):[]; }
+    function readMainValue(sid){ const el=$id('wfMain_'+sid); return el && !el.disabled ? txt(el.value) : ''; }
+    function readDue(sid){ return (($id('wfDue_'+sid)||{}).value)||''; }
+    function readContent(sid, step){ return (($id('wfContent_'+sid)||{}).value)||('Hỗ trợ: '+txt((step&&step.StepName)||'bước quy trình')); }
+    function hasAssignableWidget(sid){
+      const m=$id('wfMain_'+sid), p=$id('wfPerson_'+sid);
+      return !!((m && !m.disabled) || (p && !p.disabled));
+    }
+    function getRenderedStepIds(){
+      const ids=new Set();
+      document.querySelectorAll('[id^="wfPerson_"],[id^="wfMain_"],[id^="wfDue_"]').forEach(el=>{
+        const id=el.id.replace(/^wf(Person|Main|Due)_/,''); if(id) ids.add(id);
+      });
+      return Array.from(ids);
+    }
+    function buildPayloadForStep(stepKey){
+      const step=findStepLoose(stepKey);
+      if(!step) return [];
+      const sid=sidOf(step) || txt(stepKey);
+      const due=readDue(sid);
+      const payload=[];
+      const mainVal=readMainValue(sid);
+      if(mainVal){
+        payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:mainVal,DueDate:due,AssignmentRole:'Main',StepRole:'Main',Content:'Người thực hiện chính của bước'});
+      }
+      const selected=readSupportSelected(sid);
+      selected.forEach(uid=>{
+        if(uid && uid!==mainVal) payload.push({TaskID:taskId(),StepID:sid,SupportPersonID:uid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',Content:readContent(sid, step)});
+      });
+      // Đúng logic: không chọn hỗ trợ vẫn là một thao tác lưu hợp lệ, nhưng backend chỉ ghi cờ SELF trên TaskWorkflowSteps, không tạo SupportTasks.
+      if(!selected.length && !mainVal){
+        payload.push({TaskID:taskId(),StepID:sid,DueDate:due,AssignmentRole:'Support',StepRole:'Support',NoSupportSelected:true,SupportMode:'SELF',Content:'Main tự thực hiện phần việc của bước'});
+      }
+      return payload;
+    }
+    window.assignWorkflowStepPro = async function(stepKey){
+      const step=findStepLoose(stepKey);
+      if(!step) return alert('Không xác định được bước để lưu. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ.');
+      const payload=buildPayloadForStep(stepKey);
+      if(!payload.length) return alert('Không có dữ liệu bước để lưu.');
+      try{
+        await api(payload.length>1?'batchAssignWorkflowSteps':'assignWorkflowStep', payload.length>1?{assignments:payload}:{assignment:payload[0]});
+        alert('Đã lưu phân công bước.');
+        if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId());
+        if(window.loadTasks) await loadTasks();
+        if(window.loadMySupportTasks) await loadMySupportTasks(true);
+      }catch(e){ alert(e.message||e); }
+    };
+    window.batchAssignWorkflowStepsPro = async function(){
+      let payload=[];
+      getRenderedStepIds().forEach(sid=>{ if(hasAssignableWidget(sid)) payload=payload.concat(buildPayloadForStep(sid)); });
+      if(!payload.length) return alert('Không có bước nào đang có quyền để lưu.');
+      try{
+        await api('batchAssignWorkflowSteps',{assignments:payload});
+        alert('Đã lưu toàn bộ phân công. Bước không chọn hỗ trợ được ghi nhận Main tự thực hiện, không tạo dòng SupportTasks.');
+        if(window.loadTaskWorkflow) await loadTaskWorkflow(taskId());
+        if(window.loadTasks) await loadTasks();
+        if(window.loadMySupportTasks) await loadMySupportTasks(true);
+      }catch(e){ alert(e.message||e); }
+    };
+  });
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v99: Main step progress update UI ==== */
+(function(){
+  function byId(id){ return document.getElementById(id); }
+  function h(v){ return String(v == null ? '' : v).replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); }
+  function norm(v){ return String(v == null ? '' : v).trim(); }
+  function low(v){ return norm(v).toLowerCase(); }
+  function eq(a,b){ return low(a) === low(b) && norm(a) !== ''; }
+  function meId(){ return norm(window.me && (me.UserID || me.Email)); }
+  function meRole(){ return low(window.me && me.Role); }
+  function meUnit(){ return norm(window.me && (me.Unit || me.Department || me.DepartmentName)); }
+  function taskId(){ var el=byId('TaskID'); return norm(el && el.value); }
+  function stepId(s){ return norm(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID || s.StepNo || s.StepOrder)); }
+  function stepUnit(s){ return norm(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit)); }
+  function isAdminLeader(){ return meRole()==='admin' || meRole()==='leader'; }
+  function isManagerOfStep(s){ return meRole()==='manager' && eq(meUnit(), stepUnit(s)); }
+  function isMainOfStep(s){ return eq(meId(), s && s.MainPersonID) || /main|chính|chinh/i.test(norm(s && s.CurrentUserWorkflowRole)); }
+  function canUpdateStep(s){ return isAdminLeader() || isManagerOfStep(s) || isMainOfStep(s); }
+  function statusClass(status,p){ status=norm(status); p=Number(p||0); if(/hoàn thành|hoan thanh/i.test(status)||p>=100) return 'st-ok'; if(/chậm|nguy/i.test(status)) return 'st-risk'; return 'st-run'; }
+  function supportRowsForStep(s){ var sid=stepId(s); return (((window.taskWorkflow||{}).supportTasks)||[]).filter(function(r){
+    var role=norm(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role);
+    return eq(r.WorkflowStepID || r.StepID || r.StepInstanceID, sid) && !/main|chính|chinh/i.test(role);
+  }); }
+  function fieldId(prefix,s){ return prefix + '_' + stepId(s).replace(/[^a-zA-Z0-9_\-]/g,'_'); }
+  function renderMainStepCard(s){
+    var sid=stepId(s), p=Number(s.Progress||0), status=norm(s.Status|| (p>=100?'Hoàn thành':'Đang thực hiện'));
+    var supports=supportRowsForStep(s);
+    var readonly = canUpdateStep(s) ? '' : 'disabled';
+    var supportList = supports.length ? supports.map(function(x){ return '<span class="participant-chip support">'+h(x.SupportPersonName || x.SupportPersonID)+' · '+h(x.Status || 'Đã giao')+' · '+h(x.Progress||0)+'%</span>'; }).join('') : '<span class="participant-chip main">Main tự thực hiện</span>';
+    return '<div class="workflow-step-card pro">'
+      + '<div class="workflow-step-head"><div><span class="workflow-step-no">'+h(s.StepNo||'')+'</span><b>'+h(s.StepName||'Bước quy trình')+'</b>'
+      + '<div class="muted">'+h(s.Description||'')+'</div><div class="muted"><b>Đơn vị:</b> '+h(stepUnit(s)||'')+' · <b>Main:</b> '+h(s.MainPersonName||s.MainPersonID||'')+'</div></div>'
+      + '<span class="pill '+statusClass(status,p)+'">'+h(status)+'</span></div>'
+      + '<div class="participant-chip-list">'+supportList+'</div>'
+      + '<div class="formgrid" style="margin-top:12px">'
+      + '<input type="hidden" id="'+fieldId('stepId',s)+'" value="'+h(sid)+'">'
+      + '<div><label>Tiến độ bước (%)</label><input '+readonly+' id="'+fieldId('stepProgress',s)+'" type="number" min="0" max="100" value="'+h(p)+'"></div>'
+      + '<div><label>Trạng thái bước</label><select '+readonly+' id="'+fieldId('stepStatus',s)+'"><option '+(status==='Đã giao'?'selected':'')+'>Đã giao</option><option '+(status==='Đang thực hiện'?'selected':'')+'>Đang thực hiện</option><option '+(status==='Hoàn thành'?'selected':'')+'>Hoàn thành</option><option '+(status==='Chậm tiến độ'?'selected':'')+'>Chậm tiến độ</option></select></div>'
+      + '<div class="full"><label>Ghi chú tiến độ</label><textarea '+readonly+' id="'+fieldId('stepNote',s)+'">'+h(s.UpdateNote||s.Note||'')+'</textarea></div>'
+      + '<div><label>Tiêu đề minh chứng</label><input '+readonly+' id="'+fieldId('stepEvTitle',s)+'" value="'+h(s.EvidenceTitle||'')+'"></div>'
+      + '<div><label>Link minh chứng</label><input '+readonly+' id="'+fieldId('stepEvUrl',s)+'" value="'+h(s.EvidenceUrl||s.EvidenceURL||'')+'"></div>'
+      + '<div class="full"><label>Ghi chú minh chứng</label><input '+readonly+' id="'+fieldId('stepEvNote',s)+'" value="'+h(s.EvidenceNote||'')+'"></div>'
+      + '<div class="full" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'+(canUpdateStep(s)?'<button class="btn" onclick="arihaV99SaveMainStepProgress(\''+h(sid)+'\')">Cập nhật tiến độ bước</button>':'<div class="readonly-note">Bạn chỉ có quyền xem bước này.</div>')
+      + (s.EvidenceUrl?'<a class="btn secondary" target="_blank" href="'+h(s.EvidenceUrl||s.EvidenceURL)+'">Mở minh chứng</a>':'')+'</div></div></div>';
+  }
+  window.arihaV99SaveMainStepProgress = async function(sid){
+    try{
+      var safe=sid.replace(/[^a-zA-Z0-9_\-]/g,'_');
+      var update={
+        TaskID: taskId(),
+        StepID: sid,
+        Progress: Number((byId('stepProgress_'+safe)||{}).value || 0),
+        Status: (byId('stepStatus_'+safe)||{}).value || '',
+        UpdateNote: (byId('stepNote_'+safe)||{}).value || '',
+        EvidenceTitle: (byId('stepEvTitle_'+safe)||{}).value || '',
+        EvidenceUrl: (byId('stepEvUrl_'+safe)||{}).value || '',
+        EvidenceNote: (byId('stepEvNote_'+safe)||{}).value || ''
+      };
+      if(!update.TaskID) throw new Error('Thiếu mã nhiệm vụ');
+      if(!update.StepID) throw new Error('Thiếu bước quy trình');
+      await api('saveStepProgress',{update:update});
+      if(window.toastPro) toastPro('Đã cập nhật tiến độ bước','ok'); else alert('Đã cập nhật tiến độ bước');
+      if(window.loadTaskWorkflow) await loadTaskWorkflow(update.TaskID);
+      if(window.loadMySupportTasks) await loadMySupportTasks(true);
+      renderSupportProgressReportBox();
+    }catch(e){ alert((e && e.message) || e); }
+  };
+  window.renderSupportProgressReportBox = function(){
+    var box=byId('supportProgressReportBox'); if(!box) return;
+    var steps=((window.taskWorkflow||{}).steps)||[];
+    var supportRows=((window.taskWorkflow||{}).supportTasks)||[];
+    var visibleSteps=steps.filter(function(s){ return canUpdateStep(s) || isMainOfStep(s) || supportRowsForStep(s).some(function(r){ return eq(r.SupportPersonID, meId()); }); });
+    var supportOnlyRows=supportRows.filter(function(r){
+      var role=norm(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role);
+      return eq(r.SupportPersonID, meId()) && !/main|chính|chinh/i.test(role);
+    });
+    var html='<h2>Báo cáo tiến độ bước</h2><div class="muted">Main cập nhật tiến độ trực tiếp trên bước quy trình. Support thật cập nhật trong phần việc hỗ trợ riêng.</div>';
+    if(visibleSteps.length){
+      html += '<div class="progress-report-grid" style="display:block;margin-top:12px">' + visibleSteps.map(renderMainStepCard).join('') + '</div>';
+    } else {
+      html += '<div class="readonly-note" style="margin-top:12px">Chưa có bước quy trình để hiển thị báo cáo tiến độ.</div>';
+    }
+    if(supportOnlyRows.length){
+      html += '<h3 style="margin-top:18px;color:#1e3a8a">Phần việc hỗ trợ được giao cho bạn</h3>'
+        + supportOnlyRows.map(function(r){
+          var p=Number(r.Progress||0), status=norm(r.Status||'Đã giao');
+          return '<div class="workflow-step-card"><div class="workflow-step-head"><div><span class="workflow-step-no">'+h(r.WorkflowStepNo||r.StepNo||'')+'</span><b>'+h(r.WorkflowStepName||r.StepName||r.Content||'Phần việc hỗ trợ')+'</b><div class="muted">Người giao: '+h(r.AssignedByName||r.UpdatedByName||'')+' · Hạn: '+h(r.DueDate||'')+'</div></div><span class="pill '+statusClass(status,p)+'">'+h(status)+'</span></div><div class="progress" style="width:100%"><div class="bar" style="width:'+Math.min(100,Math.max(0,p))+'%"></div></div><div style="margin-top:10px"><button class="btn secondary" onclick="openMySupportTask(\''+h(r.SupportTaskID)+'\')">Cập nhật hỗ trợ</button></div></div>';
+        }).join('');
+    }
+    box.innerHTML=html;
+  };
+  var oldShow = window.showTaskTab;
+  window.showTaskTab = function(p,btn){
+    if(oldShow) oldShow.apply(this, arguments);
+    if(p === 'supportReport') setTimeout(function(){ try{ renderSupportProgressReportBox(); }catch(e){ console.warn(e); } },0);
+  };
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v100: SYNC TASKWORKFLOW + SINGLE SUPPORT REPORT RENDERER
+   Fix: Main đã có trong TaskWorkflowSteps nhưng tab Báo cáo tiến độ vẫn báo rỗng do render trước khi load/sync workflow.
+   Rule: Main cập nhật TaskWorkflowSteps; Support thật cập nhật SupportTasks.
+*/
+(function(){
+  function byId(id){ return document.getElementById(id); }
+  function esc(v){ return String(v == null ? '' : v).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function norm(v){ return String(v == null ? '' : v).trim(); }
+  function low(v){ return norm(v).toLowerCase(); }
+  function same(a,b){ return !!norm(a) && low(a) === low(b); }
+  function arr(v){ return Array.isArray(v) ? v : []; }
+  function getMe(){ return window.me || {}; }
+  function meId(){ return norm(getMe().UserID || getMe().Email); }
+  function meRole(){ return low(getMe().Role); }
+  function meUnit(){ return norm(getMe().Unit || getMe().Department || getMe().DepartmentName); }
+  function taskId(){ return norm((byId('TaskID')||{}).value || (window.currentTask||{}).TaskID); }
+  function stepId(s){ return norm(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID || s.TemplateStepId || s.StepNo || s.StepOrder)); }
+  function stepNo(s){ return norm(s && (s.StepNo || s.StepOrder || s.Order || '')); }
+  function stepUnit(s){ return norm(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit)); }
+  function wfObj(){
+    var w = window.taskWorkflow || {};
+    try{ if((!arr(w.steps).length) && typeof taskWorkflow !== 'undefined') w = taskWorkflow || w; }catch(e){}
+    return {steps: arr(w.steps), supportTasks: arr(w.supportTasks), participantMatrix: arr(w.participantMatrix)};
+  }
+  function syncWorkflow(data){
+    data = data || {};
+    var w = {steps: arr(data.steps), supportTasks: arr(data.supportTasks), participantMatrix: arr(data.participantMatrix), allowSelfEvaluation: !!data.allowSelfEvaluation};
+    window.taskWorkflow = w;
+    try{ taskWorkflow = w; }catch(e){}
+    return w;
+  }
+  async function forceLoadWorkflow(id){
+    id = norm(id || taskId());
+    if(!id) return wfObj();
+    var data = await api('listTaskWorkflow', {taskId:id});
+    var w = syncWorkflow(data);
+    try{ if(window.applyTaskModalRolePermissions) window.applyTaskModalRolePermissions(); }catch(e){}
+    try{ if(window.arihaRenderUnitStepMainPanel) window.arihaRenderUnitStepMainPanel(); }catch(e){}
+    return w;
+  }
+  function isAdminLeader(){ return meRole()==='admin' || meRole()==='leader'; }
+  function isManagerOfStep(s){ return meRole()==='manager' && same(meUnit(), stepUnit(s)); }
+  function roleName(r){ r = norm(r); return /main|chính|chinh/i.test(r) ? 'Main' : (/support|hỗ trợ|ho tro/i.test(r) ? 'Support' : r); }
+  function rowsForStep(s){
+    var sid = stepId(s);
+    return wfObj().supportTasks.filter(function(r){
+      var rid = norm(r.WorkflowStepID || r.StepID || r.StepInstanceID || r.TemplateStepID || r.StepNo || r.StepOrder);
+      return sid && rid && (rid === sid || (stepNo(s) && rid === stepNo(s))) && low(r.IsActive) !== 'false';
+    });
+  }
+  function supportRowsForStep(s){
+    return rowsForStep(s).filter(function(r){ return roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role) !== 'Main'; });
+  }
+  function isMainOfStep(s){
+    var uid = meId();
+    if(!uid || !s) return false;
+    if(same(uid, s.MainPersonID) || same(uid, s.MainUserID) || same(uid, s.MainPersonEmail)) return true;
+    if(/main|chính|chinh/i.test(norm(s.CurrentUserWorkflowRole || s.CurrentUserRole || s.RoleInStep))) return true;
+    return rowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role) === 'Main'; });
+  }
+  function isSupportOfStep(s){
+    var uid = meId();
+    return supportRowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID); });
+  }
+  function canUpdateStep(s){ return isAdminLeader() || isManagerOfStep(s) || isMainOfStep(s); }
+  function canViewStep(s){ return canUpdateStep(s) || isSupportOfStep(s) || s.CanViewStep === true; }
+  function statusClass(status,p){ status=norm(status); p=Number(p||0); if(/hoàn thành|hoan thanh/i.test(status)||p>=100) return 'st-ok'; if(/chậm|nguy|quá hạn|qua han/i.test(status)) return 'st-risk'; return 'st-run'; }
+  function fieldId(prefix,s){ return prefix + '_' + stepId(s).replace(/[^a-zA-Z0-9_\-]/g,'_'); }
+  function renderStepCard(s){
+    var sid = stepId(s), p = Math.max(0, Math.min(100, Number(s.Progress || 0)));
+    var status = norm(s.Status || (p>=100?'Hoàn thành':'Đang thực hiện'));
+    var supports = supportRowsForStep(s);
+    var readonly = canUpdateStep(s) ? '' : 'disabled';
+    var supportList = supports.length
+      ? supports.map(function(x){ return '<span class="participant-chip support">'+esc(x.SupportPersonName || x.UserName || x.SupportPersonID)+' · '+esc(x.Status || 'Đã giao')+' · '+esc(x.Progress || 0)+'%</span>'; }).join('')
+      : '<span class="participant-chip main">Main tự thực hiện</span>';
+    return '<div class="workflow-step-card pro">'
+      + '<div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(stepNo(s))+'</span><b>'+esc(s.StepName || 'Bước quy trình')+'</b>'
+      + '<div class="muted">'+esc(s.Description || '')+'</div><div class="muted"><b>Đơn vị:</b> '+esc(stepUnit(s) || '')+' · <b>Main:</b> '+esc(s.MainPersonName || s.MainName || s.MainPersonID || '')+'</div></div>'
+      + '<span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div>'
+      + '<div class="participant-chip-list">'+supportList+'</div>'
+      + '<div class="progress" style="width:100%;margin-top:10px"><div class="bar" style="width:'+p+'%"></div></div><div class="muted" style="margin-top:4px">Tiến độ bước: <b>'+p+'%</b></div>'
+      + '<div class="formgrid" style="margin-top:12px">'
+      + '<div><label>Tiến độ bước (%)</label><input '+readonly+' id="'+fieldId('stepProgress',s)+'" type="number" min="0" max="100" value="'+esc(p)+'"></div>'
+      + '<div><label>Trạng thái bước</label><select '+readonly+' id="'+fieldId('stepStatus',s)+'"><option '+(status==='Đã giao'?'selected':'')+'>Đã giao</option><option '+(status==='Đang thực hiện'?'selected':'')+'>Đang thực hiện</option><option '+(status==='Hoàn thành'?'selected':'')+'>Hoàn thành</option><option '+(status==='Chậm tiến độ'?'selected':'')+'>Chậm tiến độ</option></select></div>'
+      + '<div class="full"><label>Ghi chú tiến độ</label><textarea '+readonly+' id="'+fieldId('stepNote',s)+'">'+esc(s.UpdateNote || s.Note || '')+'</textarea></div>'
+      + '<div><label>Tiêu đề minh chứng</label><input '+readonly+' id="'+fieldId('stepEvTitle',s)+'" value="'+esc(s.EvidenceTitle || '')+'"></div>'
+      + '<div><label>Link minh chứng</label><input '+readonly+' id="'+fieldId('stepEvUrl',s)+'" value="'+esc(s.EvidenceUrl || s.EvidenceURL || '')+'"></div>'
+      + '<div class="full"><label>Ghi chú minh chứng</label><input '+readonly+' id="'+fieldId('stepEvNote',s)+'" value="'+esc(s.EvidenceNote || '')+'"></div>'
+      + '<div class="full" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + (canUpdateStep(s) ? '<button class="btn" onclick="arihaV100SaveMainStepProgress(\''+esc(sid)+'\')">Cập nhật tiến độ bước</button>' : '<div class="readonly-note">Bạn chỉ có quyền xem bước này.</div>')
+      + ((s.EvidenceUrl || s.EvidenceURL) ? '<a class="btn secondary" target="_blank" href="'+esc(s.EvidenceUrl || s.EvidenceURL)+'">Mở minh chứng</a>' : '')
+      + '</div></div></div>';
+  }
+  function renderSupportRows(rows){
+    if(!rows.length) return '';
+    return '<h3 style="margin-top:18px;color:#1e3a8a">Phần việc hỗ trợ được giao cho bạn</h3>' + rows.map(function(r){
+      var p = Math.max(0, Math.min(100, Number(r.Progress || 0))), status = norm(r.Status || 'Đã giao');
+      return '<div class="workflow-step-card"><div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(r.WorkflowStepNo || r.StepNo || '')+'</span><b>'+esc(r.WorkflowStepName || r.StepName || r.Content || 'Phần việc hỗ trợ')+'</b><div class="muted">Người giao: '+esc(r.AssignedByName || r.UpdatedByName || '')+' · Hạn: '+esc(r.DueDate || '')+'</div></div><span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div><div class="progress" style="width:100%"><div class="bar" style="width:'+p+'%"></div></div><div style="margin-top:10px"><button class="btn secondary" onclick="openMySupportTask(\''+esc(r.SupportTaskID)+'\')">Cập nhật hỗ trợ</button></div></div>';
+    }).join('');
+  }
+  window.arihaV100SaveMainStepProgress = async function(sid){
+    try{
+      var safe = norm(sid).replace(/[^a-zA-Z0-9_\-]/g,'_');
+      var update = {
+        TaskID: taskId(),
+        StepID: sid,
+        Progress: Number((byId('stepProgress_'+safe)||{}).value || 0),
+        Status: (byId('stepStatus_'+safe)||{}).value || '',
+        UpdateNote: (byId('stepNote_'+safe)||{}).value || '',
+        EvidenceTitle: (byId('stepEvTitle_'+safe)||{}).value || '',
+        EvidenceUrl: (byId('stepEvUrl_'+safe)||{}).value || '',
+        EvidenceNote: (byId('stepEvNote_'+safe)||{}).value || ''
+      };
+      if(!update.TaskID) throw new Error('Thiếu mã nhiệm vụ');
+      if(!update.StepID) throw new Error('Thiếu bước quy trình');
+      await api('saveStepProgress', {update:update});
+      alert('Đã cập nhật tiến độ bước');
+      await forceLoadWorkflow(update.TaskID);
+      if(window.loadMySupportTasks) await window.loadMySupportTasks(true);
+      window.renderSupportProgressReportBox();
+    }catch(e){ alert((e && e.message) || e); }
+  };
+  window.renderSupportProgressReportBox = async function(){
+    var box = byId('supportProgressReportBox'); if(!box) return;
+    var tid = taskId();
+    var w = wfObj();
+    if(tid && !w.steps.length){
+      box.innerHTML = '<div class="muted">Đang tải bước quy trình...</div>';
+      try{ w = await forceLoadWorkflow(tid); }catch(e){ box.innerHTML = '<div class="readonly-note">Không tải được bước quy trình: '+esc(e.message || e)+'</div>'; return; }
+    }
+    var visibleSteps = w.steps.filter(canViewStep);
+    var supportOnlyRows = w.supportTasks.filter(function(r){ return same(r.SupportPersonID || r.UserID || r.PersonID, meId()) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role) !== 'Main'; });
+    var html = '<h2>Báo cáo tiến độ bước</h2><div class="muted">Người thực hiện chính cập nhật tiến độ trực tiếp trên từng bước quy trình. Người hỗ trợ thật cập nhật phần việc hỗ trợ riêng.</div>';
+    if(visibleSteps.length){ html += '<div class="progress-report-grid" style="display:block;margin-top:12px">' + visibleSteps.map(renderStepCard).join('') + '</div>'; }
+    else { html += '<div class="readonly-note" style="margin-top:12px">Chưa có bước quy trình để hiển thị báo cáo tiến độ. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ nếu vừa phân công Main.</div>'; }
+    html += renderSupportRows(supportOnlyRows);
+    box.innerHTML = html;
+  };
+  var oldLoad = window.loadTaskWorkflow;
+  window.loadTaskWorkflow = async function(id){
+    var data;
+    try{ data = await api('listTaskWorkflow', {taskId:id}); }
+    catch(e){ if(oldLoad) data = await oldLoad.apply(this, arguments); else throw e; }
+    var w = syncWorkflow(data || {});
+    try{ if(window.renderTaskWorkflowBox) window.renderTaskWorkflowBox(); }catch(e){}
+    try{ if(window.renderTaskOverallProgressDashboard) window.renderTaskOverallProgressDashboard(); }catch(e){}
+    try{ if(window.renderSupportEvaluationDashboard) window.renderSupportEvaluationDashboard(); }catch(e){}
+    try{ if(window.applyTaskModalRolePermissions) window.applyTaskModalRolePermissions(); }catch(e){}
+    return w;
+  };
+  var oldShow = window.showTaskTab;
+  window.showTaskTab = function(p, btn){
+    var ret = oldShow ? oldShow.apply(this, arguments) : undefined;
+    if(p === 'supportReport'){
+      setTimeout(function(){ window.renderSupportProgressReportBox(); }, 20);
+    }
+    return ret;
+  };
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v101: FULL WORKFLOW STEP VISIBILITY + PERMISSIONED PROGRESS UPDATE
+   - Hiển thị toàn bộ bước quy trình trong tab Báo cáo tiến độ hỗ trợ.
+   - Mỗi bước mặc định thu gọn; bấm Cập nhật tiến độ/Xem chi tiết mới mở panel.
+   - Chỉ Main của bước được lưu tiến độ bước vào TaskWorkflowSteps.
+   - Support thật vẫn cập nhật ở danh sách/phiếu SupportTasks riêng.
+*/
+(function(){
+  function byId(id){ return document.getElementById(id); }
+  function esc(v){ return String(v == null ? '' : v).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+  function norm(v){ return String(v == null ? '' : v).trim(); }
+  function low(v){ return norm(v).toLowerCase(); }
+  function arr(v){ return Array.isArray(v) ? v : []; }
+  function same(a,b){ return !!norm(a) && low(a) === low(b); }
+  function getMe(){ return window.me || {}; }
+  function meId(){ return norm(getMe().UserID || getMe().Email); }
+  function meRole(){ return low(getMe().Role); }
+  function meUnit(){ return norm(getMe().Unit || getMe().Department || getMe().DepartmentName); }
+  function taskId(){ return norm((byId('TaskID')||{}).value || (window.currentTask||{}).TaskID); }
+  function wfObj(){
+    var w = window.taskWorkflow || {};
+    try{ if(!arr(w.steps).length && typeof taskWorkflow !== 'undefined') w = taskWorkflow || w; }catch(e){}
+    return {steps:arr(w.steps), supportTasks:arr(w.supportTasks), participantMatrix:arr(w.participantMatrix)};
+  }
+  function syncWorkflow(data){
+    data=data||{}; var w={steps:arr(data.steps), supportTasks:arr(data.supportTasks), participantMatrix:arr(data.participantMatrix), allowSelfEvaluation:!!data.allowSelfEvaluation};
+    window.taskWorkflow=w; try{ taskWorkflow=w; }catch(e){} return w;
+  }
+  async function forceLoadWorkflow(id){
+    id=norm(id||taskId()); if(!id) return wfObj();
+    var data=await api('listTaskWorkflow',{taskId:id});
+    var w=syncWorkflow(data);
+    try{ if(window.applyTaskModalRolePermissions) window.applyTaskModalRolePermissions(); }catch(e){}
+    try{ if(window.arihaRenderUnitStepMainPanel) window.arihaRenderUnitStepMainPanel(); }catch(e){}
+    return w;
+  }
+  function stepId(s){ return norm(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID || s.TemplateStepId || s.StepNo || s.StepOrder)); }
+  function stepNo(s){ return norm(s && (s.StepNo || s.StepOrder || s.Order || '')); }
+  function stepUnit(s){ return norm(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit)); }
+  function fieldId(prefix,s){ return prefix+'_'+stepId(s).replace(/[^a-zA-Z0-9_\-]/g,'_'); }
+  function roleName(r){ r=norm(r); return /main|chính|chinh/i.test(r)?'Main':(/support|hỗ trợ|ho tro/i.test(r)?'Support':r); }
+  function rowsForStep(s){
+    var sid=stepId(s), sno=stepNo(s);
+    return wfObj().supportTasks.filter(function(r){
+      var rid=norm(r.WorkflowStepID || r.StepID || r.StepInstanceID || r.TemplateStepID || r.StepNo || r.StepOrder);
+      return sid && rid && (rid===sid || (sno && rid===sno)) && low(r.IsActive)!=='false';
+    });
+  }
+  function supportRowsForStep(s){ return rowsForStep(s).filter(function(r){ return roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role) !== 'Main'; }); }
+  function isMainOfStep(s){
+    var uid=meId(); if(!uid || !s) return false;
+    if(same(uid,s.MainPersonID) || same(uid,s.MainUserID) || same(uid,s.MainPersonEmail)) return true;
+    if(/main|chính|chinh/i.test(norm(s.CurrentUserWorkflowRole || s.CurrentUserRole || s.RoleInStep))) return true;
+    return rowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role)==='Main'; });
+  }
+  function isSupportOfStep(s){ var uid=meId(); return supportRowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID); }); }
+  function canUpdateStep(s){ return isMainOfStep(s); }
+  function canViewPrivileged(s){ return meRole()==='admin' || meRole()==='leader' || (meRole()==='manager' && same(meUnit(), stepUnit(s))); }
+  function statusClass(status,p){ status=norm(status); p=Number(p||0); if(/hoàn thành|hoan thanh/i.test(status)||p>=100) return 'st-ok'; if(/chậm|nguy|quá hạn|qua han/i.test(status)) return 'st-risk'; return 'st-run'; }
+  function safeSid(sid){ return norm(sid).replace(/[^a-zA-Z0-9_\-]/g,'_'); }
+  function supportSummary(s){
+    var supports=supportRowsForStep(s);
+    if(supports.length){
+      return supports.map(function(x){ return '<span class="participant-chip support">'+esc(x.SupportPersonName || x.UserName || x.SupportPersonID)+' · '+esc(x.Status || 'Đã giao')+' · '+esc(x.Progress || 0)+'%</span>'; }).join('');
+    }
+    return '<span class="participant-chip main">Main tự thực hiện / chưa có hỗ trợ riêng</span>';
+  }
+  function permissionNote(s){
+    if(canUpdateStep(s)) return '<span class="participant-chip main">Bạn là Main - được cập nhật</span>';
+    if(isSupportOfStep(s)) return '<span class="participant-chip support">Bạn là Support - cập nhật ở phần việc hỗ trợ</span>';
+    if(canViewPrivileged(s)) return '<span class="participant-chip">Theo dõi theo quyền quản lý</span>';
+    return '<span class="participant-chip">Chỉ xem tiến độ quy trình</span>';
+  }
+  function renderStepCard(s){
+    var sid=stepId(s), safe=safeSid(sid), p=Math.max(0,Math.min(100,Number(s.Progress||0)));
+    var status=norm(s.Status || (p>=100?'Hoàn thành':'Đang thực hiện'));
+    var can=canUpdateStep(s), readonly=can?'':'disabled';
+    var detailId='v101_step_detail_'+safe;
+    var btnLabel=can?'Cập nhật tiến độ':'Xem chi tiết';
+    return '<div class="workflow-step-card pro" data-step-id="'+esc(sid)+'">'
+      + '<div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(stepNo(s))+'</span><b>'+esc(s.StepName || 'Bước quy trình')+'</b>'
+      + '<div class="muted">'+esc(s.Description || '')+'</div>'
+      + '<div class="muted"><b>Đơn vị:</b> '+esc(stepUnit(s)||'')+' · <b>Main:</b> '+esc(s.MainPersonName || s.MainName || s.MainPersonID || 'Chưa giao')+'</div></div>'
+      + '<span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div>'
+      + '<div class="participant-chip-list">'+permissionNote(s)+supportSummary(s)+'</div>'
+      + '<div class="progress" style="width:100%;margin-top:10px"><div class="bar" style="width:'+p+'%"></div></div>'
+      + '<div class="muted" style="margin-top:4px;display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><span>Tiến độ bước: <b>'+p+'%</b></span><button class="btn secondary" onclick="arihaV101ToggleStepDetail(\''+esc(safe)+'\')">'+btnLabel+'</button></div>'
+      + '<div id="'+detailId+'" class="formgrid" style="display:none;margin-top:12px">'
+      + '<div><label>Tiến độ bước (%)</label><input '+readonly+' id="'+fieldId('stepProgress',s)+'" type="number" min="0" max="100" value="'+esc(p)+'"></div>'
+      + '<div><label>Trạng thái bước</label><select '+readonly+' id="'+fieldId('stepStatus',s)+'"><option '+(status==='Đã giao'?'selected':'')+'>Đã giao</option><option '+(status==='Đang thực hiện'?'selected':'')+'>Đang thực hiện</option><option '+(status==='Hoàn thành'?'selected':'')+'>Hoàn thành</option><option '+(status==='Chậm tiến độ'?'selected':'')+'>Chậm tiến độ</option></select></div>'
+      + '<div class="full"><label>Ghi chú tiến độ</label><textarea '+readonly+' id="'+fieldId('stepNote',s)+'">'+esc(s.UpdateNote || s.Note || '')+'</textarea></div>'
+      + '<div><label>Tiêu đề minh chứng</label><input '+readonly+' id="'+fieldId('stepEvTitle',s)+'" value="'+esc(s.EvidenceTitle || '')+'"></div>'
+      + '<div><label>Link minh chứng</label><input '+readonly+' id="'+fieldId('stepEvUrl',s)+'" value="'+esc(s.EvidenceUrl || s.EvidenceURL || '')+'"></div>'
+      + '<div class="full"><label>Ghi chú minh chứng</label><input '+readonly+' id="'+fieldId('stepEvNote',s)+'" value="'+esc(s.EvidenceNote || '')+'"></div>'
+      + '<div class="full" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + (can?'<button class="btn" onclick="arihaV101SaveMainStepProgress(\''+esc(sid)+'\')">Lưu cập nhật bước</button>':'<div class="readonly-note">Bạn không được phân công Main bước này nên chỉ xem, không cập nhật.</div>')
+      + ((s.EvidenceUrl || s.EvidenceURL)?'<a class="btn secondary" target="_blank" href="'+esc(s.EvidenceUrl || s.EvidenceURL)+'">Mở minh chứng</a>':'')
+      + '</div></div></div>';
+  }
+  function renderSupportRows(rows){
+    if(!rows.length) return '';
+    return '<h3 style="margin-top:18px;color:#1e3a8a">Phần việc hỗ trợ được giao cho bạn</h3>' + rows.map(function(r){
+      var p=Math.max(0,Math.min(100,Number(r.Progress||0))), status=norm(r.Status||'Đã giao');
+      return '<div class="workflow-step-card"><div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(r.WorkflowStepNo || r.StepNo || '')+'</span><b>'+esc(r.WorkflowStepName || r.StepName || r.Content || 'Phần việc hỗ trợ')+'</b><div class="muted">Người giao: '+esc(r.AssignedByName || r.UpdatedByName || '')+' · Hạn: '+esc(r.DueDate || '')+'</div></div><span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div><div class="progress" style="width:100%"><div class="bar" style="width:'+p+'%"></div></div><div style="margin-top:10px"><button class="btn secondary" onclick="openMySupportTask(\''+esc(r.SupportTaskID)+'\')">Cập nhật hỗ trợ</button></div></div>';
+    }).join('');
+  }
+  window.arihaV101ToggleStepDetail=function(safe){
+    var el=byId('v101_step_detail_'+safe); if(!el) return;
+    el.style.display = (el.style.display==='none' || !el.style.display) ? 'grid' : 'none';
+  };
+  window.arihaV101SaveMainStepProgress=async function(sid){
+    try{
+      var safe=safeSid(sid);
+      var update={
+        TaskID: taskId(), StepID: sid,
+        Progress: Number((byId('stepProgress_'+safe)||{}).value || 0),
+        Status: (byId('stepStatus_'+safe)||{}).value || '',
+        UpdateNote: (byId('stepNote_'+safe)||{}).value || '',
+        EvidenceTitle: (byId('stepEvTitle_'+safe)||{}).value || '',
+        EvidenceUrl: (byId('stepEvUrl_'+safe)||{}).value || '',
+        EvidenceNote: (byId('stepEvNote_'+safe)||{}).value || ''
+      };
+      if(!update.TaskID) throw new Error('Thiếu mã nhiệm vụ');
+      if(!update.StepID) throw new Error('Thiếu bước quy trình');
+      await api('saveStepProgress',{update:update});
+      alert('Đã cập nhật tiến độ bước');
+      await forceLoadWorkflow(update.TaskID);
+      if(window.loadMySupportTasks) await window.loadMySupportTasks(true);
+      window.renderSupportProgressReportBox();
+    }catch(e){ alert((e && e.message) || e); }
+  };
+  window.renderSupportProgressReportBox=async function(){
+    var box=byId('supportProgressReportBox'); if(!box) return;
+    var tid=taskId(), w=wfObj();
+    if(tid && !w.steps.length){
+      box.innerHTML='<div class="muted">Đang tải bước quy trình...</div>';
+      try{ w=await forceLoadWorkflow(tid); }catch(e){ box.innerHTML='<div class="readonly-note">Không tải được bước quy trình: '+esc(e.message||e)+'</div>'; return; }
+    }
+    var allSteps=arr(w.steps).slice().sort(function(a,b){ return Number(stepNo(a)||a.StepOrder||0)-Number(stepNo(b)||b.StepOrder||0); });
+    var supportOnlyRows=arr(w.supportTasks).filter(function(r){ return same(r.SupportPersonID || r.UserID || r.PersonID, meId()) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role)!=='Main'; });
+    var html='<h2>Báo cáo tiến độ bước</h2><div class="muted">Hiển thị toàn bộ bước của quy trình. Chỉ bước bạn được giao Main mới mở quyền cập nhật; Support cập nhật ở phần việc hỗ trợ riêng.</div>';
+    if(allSteps.length){ html += '<div class="progress-report-grid" style="display:block;margin-top:12px">'+allSteps.map(renderStepCard).join('')+'</div>'; }
+    else { html += '<div class="readonly-note" style="margin-top:12px">Chưa có bước quy trình để hiển thị báo cáo tiến độ. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ nếu vừa phân công Main.</div>'; }
+    html += renderSupportRows(supportOnlyRows);
+    box.innerHTML=html;
+  };
+  var oldLoad=window.loadTaskWorkflow;
+  window.loadTaskWorkflow=async function(id){
+    var data;
+    try{ data=await api('listTaskWorkflow',{taskId:id}); }
+    catch(e){ if(oldLoad) data=await oldLoad.apply(this,arguments); else throw e; }
+    var w=syncWorkflow(data||{});
+    try{ if(window.renderTaskWorkflowBox) window.renderTaskWorkflowBox(); }catch(e){}
+    try{ if(window.renderTaskOverallProgressDashboard) window.renderTaskOverallProgressDashboard(); }catch(e){}
+    try{ if(window.renderSupportEvaluationDashboard) window.renderSupportEvaluationDashboard(); }catch(e){}
+    try{ if(window.applyTaskModalRolePermissions) window.applyTaskModalRolePermissions(); }catch(e){}
+    return w;
+  };
+  var oldShow=window.showTaskTab;
+  window.showTaskTab=function(p,btn){
+    var ret=oldShow ? oldShow.apply(this,arguments) : undefined;
+    if(p==='supportReport') setTimeout(function(){ window.renderSupportProgressReportBox(); },20);
+    return ret;
+  };
+})();
+</script>
+
+
+
+<script>
+/* ==== PATCH v101.1: ALL-ROLE CONTINUOUS WORKFLOW VISIBILITY + PERMISSIONED STEP UPDATE ==== */
+(function(){
+  function byId(id){ return document.getElementById(id); }
+  function esc(v){ return String(v == null ? '' : v).replace(/[&<>'"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]; }); }
+  function norm(v){ return String(v == null ? '' : v).trim(); }
+  function low(v){ return norm(v).toLowerCase(); }
+  function same(a,b){ return !!norm(a) && low(a) === low(b); }
+  function arr(v){ return Array.isArray(v) ? v : []; }
+  function meId(){ return norm(window.me && (me.UserID || me.Email)); }
+  function meRole(){ return low(window.me && me.Role); }
+  function meUnit(){ return norm(window.me && (me.Unit || me.Department || me.DepartmentName)); }
+  function taskId(){ var el=byId('TaskID'); return norm(el && el.value) || norm(window.currentTask && currentTask.TaskID); }
+  function wfObj(){ return window.taskWorkflow || {steps:[],supportTasks:[]}; }
+  function roleName(v){ v=low(v); if(/main|chính|chinh/.test(v)) return 'Main'; if(/support|hỗ trợ|ho tro/.test(v)) return 'Support'; return norm(v); }
+  function stepId(s){ return norm(s && (s.StepID || s.WorkflowStepID || s.StepInstanceID || s.TemplateStepID || s.StepNo || s.StepOrder)); }
+  function stepNo(s){ return norm(s && (s.StepNo || s.StepOrder || s.OrderNo || s.Sequence || stepId(s))); }
+  function stepUnit(s){ return norm(s && (s.ResponsibleUnit || s.StepManagerUnit || s.Unit || s.StepUnit || s.HostUnit)); }
+  function safeSid(sid){ return norm(sid).replace(/[^a-zA-Z0-9_\-]/g,'_'); }
+  function fieldId(prefix,s){ return prefix + '_' + safeSid(stepId(s)); }
+  function rowsForStep(s){
+    var sid=stepId(s);
+    return arr(wfObj().supportTasks).filter(function(r){
+      return same(r.WorkflowStepID || r.StepID || r.StepInstanceID || r.TemplateStepID || r.StepNo || r.StepOrder, sid);
+    });
+  }
+  function supportRowsForStep(s){ return rowsForStep(s).filter(function(r){ return roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role) !== 'Main'; }); }
+  function isAdminLeader(){ return meRole()==='admin' || meRole()==='leader'; }
+  function isManagerOfStep(s){ return meRole()==='manager' && same(meUnit(), stepUnit(s)); }
+  function isMainOfStep(s){
+    var uid=meId(); if(!uid || !s) return false;
+    if(same(uid,s.MainPersonID) || same(uid,s.MainUserID) || same(uid,s.MainPersonEmail)) return true;
+    if(/main|chính|chinh/i.test(norm(s.CurrentUserWorkflowRole || s.CurrentUserRole || s.RoleInStep))) return true;
+    return rowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role)==='Main'; });
+  }
+  function isSupportOfStep(s){ var uid=meId(); return supportRowsForStep(s).some(function(r){ return same(uid, r.SupportPersonID || r.UserID || r.PersonID); }); }
+  function canUpdateStepProgress(s){ return isAdminLeader() || isManagerOfStep(s) || isMainOfStep(s); }
+  function canViewWorkflowChain(){ return true; }
+  function pct(v){ v=Number(v||0); if(isNaN(v)) v=0; return Math.max(0,Math.min(100,Math.round(v))); }
+  function stepProgress(s){ return pct(s.Progress != null ? s.Progress : (s.ProgressPercent != null ? s.ProgressPercent : 0)); }
+  function normalizeStepStatus(s){
+    var p=stepProgress(s), st=norm(s.Status || s.StepStatus);
+    if(/quá hạn|qua han|chậm|cham|risk/i.test(st)) return 'Quá hạn';
+    if(/hoàn thành|hoan thanh|done|completed/i.test(st) || p>=100) return 'Hoàn thành';
+    if(/đang|dang|running|thực hiện|thuc hien/i.test(st) || p>0) return 'Đang thực hiện';
+    if(/đã giao|da giao|assigned/i.test(st)) return 'Đã giao';
+    if(/chờ phân công|cho phan cong|pending assign/i.test(st) || !norm(s.MainPersonID)) return 'Chờ phân công';
+    return st || 'Chưa đến lượt';
+  }
+  function statusClass(status,p){
+    status=norm(status); p=pct(p);
+    if(/hoàn thành|hoan thanh/i.test(status)||p>=100) return 'st-ok';
+    if(/quá hạn|qua han|chậm|cham/i.test(status)) return 'st-risk';
+    if(/chờ|cho|chưa|chua/i.test(status)) return 'st-warn';
+    return 'st-run';
+  }
+  function workflowTimeline(steps){
+    if(!steps.length) return '';
+    return '<div class="ariha-wf-chain"><div class="ariha-wf-chain-title"><b>Tiến trình quy trình liên tục</b><span class="muted">Tất cả vai trò đều xem đủ chuỗi bước</span></div><div class="ariha-wf-chain-scroll">'
+      + steps.map(function(s,i){ var p=stepProgress(s), st=normalizeStepStatus(s); return '<div class="ariha-wf-node '+statusClass(st,p)+'"><div class="ariha-wf-dot">'+esc(stepNo(s)||i+1)+'</div><div class="ariha-wf-node-text"><b>'+esc(s.StepName||'Bước')+'</b><span>'+esc(st)+' · '+p+'%</span></div></div>'; }).join('<div class="ariha-wf-arrow">→</div>')
+      + '</div></div>';
+  }
+  function supportSummary(s){
+    var supports=supportRowsForStep(s);
+    if(supports.length){
+      return supports.map(function(x){ return '<span class="participant-chip support">'+esc(x.SupportPersonName || x.UserName || x.SupportPersonID)+' · '+esc(x.Status || 'Đã giao')+' · '+pct(x.Progress)+'%</span>'; }).join('');
+    }
+    return '<span class="participant-chip main">Main tự thực hiện / chưa có hỗ trợ riêng</span>';
+  }
+  function permissionNote(s){
+    if(canUpdateStepProgress(s)){
+      if(isMainOfStep(s)) return '<span class="participant-chip main">Bạn là Main - được cập nhật</span>';
+      if(isManagerOfStep(s)) return '<span class="participant-chip main">Manager đơn vị bước - được cập nhật</span>';
+      return '<span class="participant-chip main">Admin/Lãnh đạo - được cập nhật</span>';
+    }
+    if(isSupportOfStep(s)) return '<span class="participant-chip support">Bạn là Support - cập nhật ở phần việc hỗ trợ</span>';
+    return '<span class="participant-chip">Theo dõi chuỗi quy trình</span>';
+  }
+  function renderStepCard(s){
+    var sid=stepId(s), safe=safeSid(sid), p=stepProgress(s), status=normalizeStepStatus(s), can=canUpdateStepProgress(s), readonly=can?'':'disabled';
+    var detailId='v101_step_detail_'+safe;
+    return '<div class="workflow-step-card pro" data-step-id="'+esc(sid)+'">'
+      + '<div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(stepNo(s))+'</span><b>'+esc(s.StepName || 'Bước quy trình')+'</b>'
+      + '<div class="muted">'+esc(s.Description || '')+'</div>'
+      + '<div class="muted"><b>Đơn vị:</b> '+esc(stepUnit(s)||'Chưa gán')+' · <b>Main:</b> '+esc(s.MainPersonName || s.MainName || s.MainPersonID || 'Chưa giao')+'</div></div>'
+      + '<span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div>'
+      + '<div class="participant-chip-list">'+permissionNote(s)+supportSummary(s)+'</div>'
+      + '<div class="progress" style="width:100%;margin-top:10px"><div class="bar" style="width:'+p+'%"></div></div>'
+      + '<div class="muted" style="margin-top:4px;display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap"><span>Tiến độ bước: <b>'+p+'%</b></span><button class="btn secondary" onclick="arihaV101ToggleStepDetail(\''+esc(safe)+'\')">'+(can?'Cập nhật tiến độ':'Theo dõi')+'</button></div>'
+      + '<div id="'+detailId+'" class="formgrid" style="display:none;margin-top:12px">'
+      + '<div><label>Tiến độ bước (%)</label><input '+readonly+' id="'+fieldId('stepProgress',s)+'" type="number" min="0" max="100" value="'+esc(p)+'"></div>'
+      + '<div><label>Trạng thái bước</label><select '+readonly+' id="'+fieldId('stepStatus',s)+'"><option '+(status==='Đã giao'?'selected':'')+'>Đã giao</option><option '+(status==='Đang thực hiện'?'selected':'')+'>Đang thực hiện</option><option '+(status==='Hoàn thành'?'selected':'')+'>Hoàn thành</option><option '+(status==='Quá hạn'?'selected':'')+'>Quá hạn</option></select></div>'
+      + '<div class="full"><label>Ghi chú tiến độ</label><textarea '+readonly+' id="'+fieldId('stepNote',s)+'">'+esc(s.UpdateNote || s.Note || '')+'</textarea></div>'
+      + '<div><label>Tiêu đề minh chứng</label><input '+readonly+' id="'+fieldId('stepEvTitle',s)+'" value="'+esc(s.EvidenceTitle || '')+'"></div>'
+      + '<div><label>Link minh chứng</label><input '+readonly+' id="'+fieldId('stepEvUrl',s)+'" value="'+esc(s.EvidenceUrl || s.EvidenceURL || '')+'"></div>'
+      + '<div class="full"><label>Ghi chú minh chứng</label><input '+readonly+' id="'+fieldId('stepEvNote',s)+'" value="'+esc(s.EvidenceNote || '')+'"></div>'
+      + '<div class="full" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + (can?'<button class="btn" onclick="arihaV101SaveMainStepProgress(\''+esc(sid)+'\')">Lưu cập nhật bước</button>':'<div class="readonly-note">Bạn được xem toàn bộ chuỗi quy trình nhưng không có quyền cập nhật bước này.</div>')
+      + ((s.EvidenceUrl || s.EvidenceURL)?'<a class="btn secondary" target="_blank" href="'+esc(s.EvidenceUrl || s.EvidenceURL)+'">Mở minh chứng</a>':'')
+      + '</div></div></div>';
+  }
+  window.arihaV101ToggleStepDetail=function(safe){ var el=byId('v101_step_detail_'+safe); if(el) el.style.display = (el.style.display==='none' || !el.style.display) ? 'grid' : 'none'; };
+  window.arihaV101SaveMainStepProgress=async function(sid){
+    try{
+      var safe=safeSid(sid);
+      var update={TaskID:taskId(),StepID:sid,Progress:Number((byId('stepProgress_'+safe)||{}).value || 0),Status:(byId('stepStatus_'+safe)||{}).value || '',UpdateNote:(byId('stepNote_'+safe)||{}).value || '',EvidenceTitle:(byId('stepEvTitle_'+safe)||{}).value || '',EvidenceUrl:(byId('stepEvUrl_'+safe)||{}).value || '',EvidenceNote:(byId('stepEvNote_'+safe)||{}).value || ''};
+      if(!update.TaskID) throw new Error('Thiếu mã nhiệm vụ'); if(!update.StepID) throw new Error('Thiếu bước quy trình');
+      await api('saveStepProgress',{update:update});
+      if(window.toastPro) toastPro('Đã cập nhật tiến độ bước','ok'); else alert('Đã cập nhật tiến độ bước');
+      if(window.loadTaskWorkflow) await window.loadTaskWorkflow(update.TaskID);
+      if(window.loadMySupportTasks) await window.loadMySupportTasks(true);
+      window.renderSupportProgressReportBox();
+    }catch(e){ alert((e && e.message) || e); }
+  };
+  function renderSupportRows(rows){
+    if(!rows.length) return '';
+    return '<h3 style="margin-top:18px;color:#1e3a8a">Phần việc hỗ trợ được giao cho bạn</h3>' + rows.map(function(r){
+      var p=pct(r.Progress), status=norm(r.Status||'Đã giao');
+      return '<div class="workflow-step-card"><div class="workflow-step-head"><div><span class="workflow-step-no">'+esc(r.WorkflowStepNo || r.StepNo || '')+'</span><b>'+esc(r.WorkflowStepName || r.StepName || r.Content || 'Phần việc hỗ trợ')+'</b><div class="muted">Người giao: '+esc(r.AssignedByName || r.UpdatedByName || '')+' · Hạn: '+esc(r.DueDate || '')+'</div></div><span class="pill '+statusClass(status,p)+'">'+esc(status)+'</span></div><div class="progress" style="width:100%"><div class="bar" style="width:'+p+'%"></div></div><div style="margin-top:10px"><button class="btn secondary" onclick="openMySupportTask(\''+esc(r.SupportTaskID)+'\')">Cập nhật hỗ trợ</button></div></div>';
+    }).join('');
+  }
+  window.renderSupportProgressReportBox=async function(){
+    var box=byId('supportProgressReportBox'); if(!box) return;
+    var tid=taskId(), w=wfObj();
+    if(tid && !arr(w.steps).length){
+      box.innerHTML='<div class="muted">Đang tải bước quy trình...</div>';
+      try{ if(window.loadTaskWorkflow) { await window.loadTaskWorkflow(tid); w=wfObj(); } }catch(e){ box.innerHTML='<div class="readonly-note">Không tải được bước quy trình: '+esc(e.message||e)+'</div>'; return; }
+    }
+    var allSteps=arr(w.steps).slice().sort(function(a,b){ return Number(stepNo(a)||a.StepOrder||0)-Number(stepNo(b)||b.StepOrder||0); });
+    var supportOnlyRows=arr(w.supportTasks).filter(function(r){ return same(r.SupportPersonID || r.UserID || r.PersonID, meId()) && roleName(r.AssignmentRole || r.StepRole || r.RoleInStep || r.Role)!=='Main'; });
+    var html='<h2>Báo cáo tiến độ bước</h2><div class="muted">Hiển thị toàn bộ chuỗi quy trình 1–2–3–4–5–6 cho mọi vai trò. Chỉ Admin/Lãnh đạo, Manager đúng đơn vị bước hoặc Main của bước mới được cập nhật tiến độ bước; Support cập nhật phần việc hỗ trợ riêng.</div>';
+    html += workflowTimeline(allSteps);
+    if(allSteps.length) html += '<div class="progress-report-grid" style="display:block;margin-top:12px">'+allSteps.map(renderStepCard).join('')+'</div>';
+    else html += '<div class="readonly-note" style="margin-top:12px">Chưa có bước quy trình để hiển thị báo cáo tiến độ. Hãy bấm Làm mới trang rồi mở lại nhiệm vụ nếu vừa phân công Main.</div>';
+    html += renderSupportRows(supportOnlyRows);
+    box.innerHTML=html;
+  };
+  /* Mở tab báo cáo tiến độ cho mọi role đã mở được nhiệm vụ; backend vẫn kiểm soát quyền cập nhật. */
+  var oldApply=window.applyTaskModalRolePermissions;
+  window.applyTaskModalRolePermissions=function(){
+    if(oldApply) { try{ oldApply.apply(this,arguments); }catch(e){ console.warn(e); } }
+    var tabReport=byId('tabSupportReport'); if(tabReport) tabReport.style.display='';
+    var note=byId('taskRoleNotice');
+    if(note && note.innerHTML && /chế độ xem/.test(note.innerHTML)) note.innerHTML='Bạn được xem toàn bộ chuỗi quy trình; chỉ bước/phần việc được phân quyền mới mở thao tác cập nhật.';
+  };
+  var oldShow=window.showTaskTab;
+  window.showTaskTab=function(p,btn){
+    if(p==='supportReport'){
+      document.querySelectorAll('#taskModal .section').forEach(function(x){ x.classList.remove('active'); });
+      ['info','progress','evidence','supportAssign','supportReport','eval'].forEach(function(k){ var el=byId('taskTab-'+k); if(el){ el.classList.toggle('active', k===p); el.style.display=k===p?'block':'none'; }});
+      if(btn && btn.parentNode){ btn.parentNode.querySelectorAll('button').forEach(function(b){ b.classList.remove('active'); }); btn.classList.add('active'); }
+      setTimeout(function(){ window.renderSupportProgressReportBox(); try{ window.applyTaskModalRolePermissions(); }catch(e){} },20);
+      return;
+    }
+    return oldShow ? oldShow.apply(this,arguments) : undefined;
+  };
+})();
+</script>
+
+<style>
+/* ==== PATCH v101.1: continuous workflow timeline ==== */
+.ariha-wf-chain{background:linear-gradient(135deg,#eef2ff,#fff);border:1px solid #c7d2fe;border-radius:18px;padding:12px;margin:14px 0;box-shadow:0 8px 22px rgba(30,58,138,.08)}
+.ariha-wf-chain-title{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px;color:#1e3a8a}
+.ariha-wf-chain-scroll{display:flex;gap:8px;align-items:stretch;overflow:auto;padding-bottom:4px}
+.ariha-wf-node{min-width:150px;background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:10px;display:flex;gap:8px;align-items:center;box-shadow:0 5px 14px rgba(15,23,42,.04)}
+.ariha-wf-node.st-ok{border-color:#86efac;background:#ecfdf5}.ariha-wf-node.st-run{border-color:#93c5fd;background:#eff6ff}.ariha-wf-node.st-warn{border-color:#fde68a;background:#fffbeb}.ariha-wf-node.st-risk{border-color:#fecaca;background:#fef2f2}
+.ariha-wf-dot{width:34px;height:34px;border-radius:999px;background:#1e3a8a;color:#fff;font-weight:900;display:flex;align-items:center;justify-content:center;flex:0 0 auto}.ariha-wf-node.st-ok .ariha-wf-dot{background:#059669}.ariha-wf-node.st-run .ariha-wf-dot{background:#2563eb}.ariha-wf-node.st-warn .ariha-wf-dot{background:#d97706}.ariha-wf-node.st-risk .ariha-wf-dot{background:#dc2626}
+.ariha-wf-node-text{display:flex;flex-direction:column;gap:3px;min-width:0}.ariha-wf-node-text b{font-size:13px;line-height:1.25;color:#0f172a}.ariha-wf-node-text span{font-size:12px;color:#64748b}.ariha-wf-arrow{display:flex;align-items:center;color:#1e3a8a;font-weight:900;font-size:18px}
+body.dark-mode .ariha-wf-chain{background:linear-gradient(135deg,#111827,#0f172a);border-color:#334155}body.dark-mode .ariha-wf-node{background:#111827;border-color:#334155}body.dark-mode .ariha-wf-node-text b{color:#e5e7eb}
+@media(max-width:820px){.ariha-wf-node{min-width:132px}.ariha-wf-arrow{display:none}}
+</style>
+
+
+
+<script>
+/* ==== PATCH ver102.2: STRICT TASK MODAL TAB ROUTER + CONTENT ISOLATION
+   Mục tiêu:
+   - Không render nhầm workflow/progress/evidence/evaluation vào tab Thông tin.
+   - 6 tab có vùng nội dung riêng biệt.
+   - Timeline chuỗi bước chỉ nằm trong tab Báo cáo tiến độ hỗ trợ.
+   - Giao Main/Support chỉ nằm trong tab Giao việc hỗ trợ.
+*/
+(function(){
+  if(window.__ARIHA_VER102_2_STRICT_TAB_ROUTER__) return;
+  window.__ARIHA_VER102_2_STRICT_TAB_ROUTER__ = true;
+
+  const byId = id => document.getElementById(id);
+  const esc = v => String(v == null ? '' : v).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+  const TASK_TABS = ['info','progress','evidence','supportAssign','supportReport','eval'];
+
+  function isActiveTab(key){
+    const el = byId('taskTab-' + key);
+    return !!(el && el.classList.contains('active') && el.style.display !== 'none');
+  }
+
+  function ensureInside(nodeId, targetTabKey, fallbackHtml){
+    const target = byId('taskTab-' + targetTabKey);
+    if(!target) return null;
+    let node = byId(nodeId);
+    if(!node){
+      const wrap = document.createElement('div');
+      wrap.id = nodeId;
+      wrap.className = 'full';
+      if(fallbackHtml) wrap.innerHTML = fallbackHtml;
+      target.appendChild(wrap);
+      node = wrap;
+    } else if(!target.contains(node)) {
+      target.appendChild(node);
+    }
+    return node;
+  }
+
+  function removeWrongContentFromInfo(){
+    const info = byId('taskTab-info');
+    if(!info) return;
+    // Các vùng này tuyệt đối không được nằm trong tab Thông tin.
+    ['taskWorkflowBox','supportProgressReportBox','taskOverallProgressDashboard','evidenceList','supportEvaluationDashboard','evaluationList','evalCriteriaBox'].forEach(id => {
+      const el = byId(id);
+      if(el && info.contains(el)){
+        if(id === 'taskWorkflowBox') ensureInside(id,'supportAssign','');
+        else if(id === 'supportProgressReportBox') ensureInside(id,'supportReport','');
+        else if(id === 'taskOverallProgressDashboard') ensureInside(id,'progress','');
+        else if(id === 'evidenceList') ensureInside(id,'evidence','');
+        else ensureInside(id,'eval','');
+      }
+    });
+    // Panel phân công Main theo đơn vị là nghiệp vụ giao việc, không nằm ở Thông tin.
+    const unitPanel = byId('arihaUnitStepMainPanelHost');
+    if(unitPanel && info.contains(unitPanel)){
+      const assignTab = byId('taskTab-supportAssign');
+      if(assignTab) assignTab.insertBefore(unitPanel, assignTab.firstChild || null);
+    }
+    // Xóa các block workflow/progress bị append lạc vào info bằng class.
+    Array.from(info.querySelectorAll('.ariha-wf-chain,.progress-report-grid,.workflow-step-card.pro,.workflow-progress-board,.workflow-ring-board,.workflow-multiring-wrap,.support-eval-summary-grid,.manager-main-eval-panel:not(#arihaFixedApprovalPanel):not(#arihaUnitStepMainPanelHost *)')).forEach(el => {
+      // Không xóa panel phê duyệt cố định; các block lạc khác sẽ bị gỡ để tránh hiển thị sai tab.
+      if(!el.closest('#arihaFixedApprovalPanel')) el.remove();
+    });
+  }
+
+  function normalizeTaskTabContainers(){
+    ensureInside('taskOverallProgressDashboard','progress','');
+    ensureInside('evidenceList','evidence','');
+    ensureInside('taskWorkflowBox','supportAssign','');
+    ensureInside('supportProgressReportBox','supportReport','');
+    ensureInside('supportEvaluationDashboard','eval','');
+    ensureInside('evaluationList','eval','');
+    removeWrongContentFromInfo();
+  }
+
+  function setActiveTab(key, btn){
+    normalizeTaskTabContainers();
+    TASK_TABS.forEach(k => {
+      const el = byId('taskTab-' + k);
+      if(el){
+        const on = k === key;
+        el.classList.toggle('active', on);
+        el.style.display = on ? 'block' : 'none';
+      }
+    });
+    const tabs = document.querySelector('#taskModal .tabs');
+    if(tabs){
+      tabs.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+      const targetBtn = btn || tabs.querySelector(`button[onclick*="showTaskTab('${key}'"]`);
+      if(targetBtn) targetBtn.classList.add('active');
+    }
+  }
+
+  function renderForTab(key){
+    const tid = (byId('TaskID') || {}).value || (window.currentTask && window.currentTask.TaskID) || '';
+    if(key === 'info'){
+      removeWrongContentFromInfo();
+      try{ if(window.currentTask && typeof window.arihaRefreshFixedApprovalPanel === 'function') window.arihaRefreshFixedApprovalPanel(); }catch(e){ console.warn(e); }
+      return;
+    }
+    if(key === 'progress'){
+      try{ if(typeof window.renderTaskOverallProgressDashboard === 'function') window.renderTaskOverallProgressDashboard(); }catch(e){ console.warn(e); }
+      return;
+    }
+    if(key === 'evidence'){
+      try{ if(typeof window.loadEvidenceAndEvals === 'function' && tid) window.loadEvidenceAndEvals(tid); }catch(e){ console.warn(e); }
+      return;
+    }
+    if(key === 'supportAssign'){
+      const box = byId('taskWorkflowBox');
+      if(box && !box.innerHTML.trim()) box.innerHTML = '<div class="skeleton"></div>';
+      const run = () => { try{ if(typeof window.renderTaskWorkflowBox === 'function') window.renderTaskWorkflowBox(); }catch(e){ console.warn(e); } };
+      if(tid && (!window.taskWorkflow || !Array.isArray(window.taskWorkflow.steps) || !window.taskWorkflow.steps.length) && typeof window.loadTaskWorkflow === 'function'){
+        Promise.resolve(window.loadTaskWorkflow(tid)).then(run).catch(e => { if(box) box.innerHTML = '<div class="readonly-note">Không tải được quy trình: '+esc(e.message||e)+'</div>'; });
+      } else run();
+      return;
+    }
+    if(key === 'supportReport'){
+      const box = byId('supportProgressReportBox');
+      if(box && !box.innerHTML.trim()) box.innerHTML = '<div class="skeleton"></div>';
+      const run = () => { try{ if(typeof window.renderSupportProgressReportBox === 'function') window.renderSupportProgressReportBox(); }catch(e){ console.warn(e); } };
+      if(tid && (!window.taskWorkflow || !Array.isArray(window.taskWorkflow.steps) || !window.taskWorkflow.steps.length) && typeof window.loadTaskWorkflow === 'function'){
+        Promise.resolve(window.loadTaskWorkflow(tid)).then(run).catch(e => { if(box) box.innerHTML = '<div class="readonly-note">Không tải được báo cáo tiến độ bước: '+esc(e.message||e)+'</div>'; });
+      } else run();
+      return;
+    }
+    if(key === 'eval'){
+      try{ if(typeof window.fillEvalTargetByRole === 'function') window.fillEvalTargetByRole(); }catch(e){ console.warn(e); }
+      try{ if(typeof window.renderSupportEvaluationDashboard === 'function') window.renderSupportEvaluationDashboard(); }catch(e){ console.warn(e); }
+      try{ if(typeof window.renderEvalCriteria === 'function') window.renderEvalCriteria(); }catch(e){ console.warn(e); }
+    }
+  }
+
+  // Chặn các hàm render bị gọi nền làm đổ nội dung vào tab sai.
+  const oldRenderWorkflowBox = window.renderTaskWorkflowBox;
+  if(typeof oldRenderWorkflowBox === 'function'){
+    window.renderTaskWorkflowBox = function(){
+      normalizeTaskTabContainers();
+      if(!isActiveTab('supportAssign')){
+        const box = byId('taskWorkflowBox');
+        if(box && !byId('taskTab-supportAssign').contains(box)) ensureInside('taskWorkflowBox','supportAssign','');
+        return;
+      }
+      return oldRenderWorkflowBox.apply(this, arguments);
+    };
+  }
+
+  const oldRenderUnitMainPanel = window.arihaRenderUnitStepMainPanel;
+  if(typeof oldRenderUnitMainPanel === 'function'){
+    window.arihaRenderUnitStepMainPanel = function(){
+      normalizeTaskTabContainers();
+      if(!isActiveTab('supportAssign')){
+        const host = byId('arihaUnitStepMainPanelHost');
+        if(host){ const assignTab = byId('taskTab-supportAssign'); if(assignTab && !assignTab.contains(host)) assignTab.insertBefore(host, assignTab.firstChild || null); }
+        return;
+      }
+      const ret = oldRenderUnitMainPanel.apply(this, arguments);
+      const host = byId('arihaUnitStepMainPanelHost');
+      const assignTab = byId('taskTab-supportAssign');
+      if(host && assignTab && !assignTab.contains(host)) assignTab.insertBefore(host, assignTab.firstChild || null);
+      return ret;
+    };
+  }
+
+  window.showTaskTab = function(key, btn){
+    if(!TASK_TABS.includes(key)) key = 'info';
+    setActiveTab(key, btn);
+    setTimeout(() => { normalizeTaskTabContainers(); renderForTab(key); }, 20);
+  };
+
+  // Khi mở nhiệm vụ: luôn trở về tab Thông tin sạch, không tự render workflow vào info.
+  const oldOpenTaskById = window.openTaskById;
+  if(typeof oldOpenTaskById === 'function'){
+    window.openTaskById = async function(){
+      const ret = await oldOpenTaskById.apply(this, arguments);
+      setTimeout(() => { window.showTaskTab('info'); normalizeTaskTabContainers(); }, 80);
+      return ret;
+    };
+  }
+
+  const oldOpenTaskModal = window.openTaskModal;
+  if(typeof oldOpenTaskModal === 'function'){
+    window.openTaskModal = function(){
+      const ret = oldOpenTaskModal.apply(this, arguments);
+      setTimeout(() => { window.showTaskTab('info'); normalizeTaskTabContainers(); }, 80);
+      return ret;
+    };
+  }
+
+  // Theo dõi modal để kéo các block lạc về đúng tab ngay khi patch cũ append sai.
+  try{
+    const modal = byId('taskModal');
+    if(modal && window.MutationObserver){
+      const mo = new MutationObserver(() => normalizeTaskTabContainers());
+      mo.observe(modal, {childList:true, subtree:true});
+      window.__ARIHA_VER102_2_TAB_OBSERVER__ = mo;
+    }
+  }catch(e){ console.warn(e); }
+
+  document.addEventListener('DOMContentLoaded', normalizeTaskTabContainers);
+  setTimeout(normalizeTaskTabContainers, 300);
+})();
+</script>
+
+<style>
+/* ==== PATCH ver102.2: tab content guard ==== */
+#taskTab-info #taskWorkflowBox,
+#taskTab-info #supportProgressReportBox,
+#taskTab-info #taskOverallProgressDashboard,
+#taskTab-info #evidenceList,
+#taskTab-info #supportEvaluationDashboard,
+#taskTab-info #evaluationList,
+#taskTab-info .ariha-wf-chain,
+#taskTab-info .progress-report-grid,
+#taskTab-info .workflow-step-card.pro,
+#taskTab-info .support-eval-summary-grid,
+#taskTab-info .workflow-progress-board,
+#taskTab-info .workflow-ring-board,
+#taskTab-info .workflow-multiring-wrap{display:none!important}
+</style>
 
 </body>
 </html>
