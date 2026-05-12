@@ -864,7 +864,7 @@ let dashboardYear = _now.getFullYear();
 let dashboardQuarter = 'Q' + (Math.floor(_now.getMonth()/3)+1);
 let dashboardMonth = _now.getMonth()+1;
 
-const API_URL = "https://script.google.com/macros/s/AKfycbyv-6sLA76qDRnCNeN9UutycOTMESFpB6rEHZRCSBUjKJSxRDiMkCn8u5m32Ne9_FMB-Q/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbzmMiUKnmkOSIhaU24fxN5sDARO8ezqEPxDguHMmYNyITdaw1Lzw-WRy9Al7oHSbda1sQ/exec";
 const USE_GOOGLE_SCRIPT_RUN = typeof google !== "undefined" && google.script && google.script.run;
 
 function apiJsonp(action, payload={}){
@@ -7967,6 +7967,216 @@ body.dark-mode .ariha-wf-chain{background:linear-gradient(135deg,#111827,#0f172a
   document.addEventListener('DOMContentLoaded', normalizeTaskTabContainers);
   setTimeout(normalizeTaskTabContainers, 300);
 })();
+
+
+/* =====================================================================
+ * VER103_FAST_MODE_CACHE_LAZY_TAB - FRONTEND OVERRIDE
+ * - Login chỉ gọi bootstrapLite, không load toàn bộ.
+ * - Danh sách dùng listTasksLite.
+ * - Modal mở tab Thông tin ngay; tab nặng lazy-load khi người dùng bấm.
+ * - Cache client theo task/tab, tự clear sau thao tác ghi.
+ * ===================================================================== */
+window.ARIHA_VER103_FAST_MODE = true;
+let __v103TaskDetailCache = {};
+let __v103TabCache = {};
+let __v103PageSize = 50;
+let __v103RenderedCount = 50;
+function v103ClearClientCache(){
+  __v103TaskDetailCache = {};
+  __v103TabCache = {};
+  __inflight = {};
+  __lastRenderSig = '';
+}
+function v103TaskCacheKey(taskId, tab){ return String(taskId||'') + '::' + String(tab||''); }
+async function v103Api(action, payload){ return api(action, payload || {}); }
+async function login(){
+  const btn = event && event.target;
+  try{
+    setBusy(btn,true,'Đang đăng nhập...');
+    const data=await api('login',{email:$('loginEmail').value,password:$('loginPass').value});
+    token=data.token; localStorage.setItem('ariha_token', token);
+    await loadCoreData(true);
+    $('loginView').style.display='none'; $('appView').style.display='grid';
+    showPage('dashboard', document.querySelector('.nav button'));
+    toastPro('Đăng nhập nhanh thành công','ok');
+  }catch(e){ alert(e.message); }
+  finally{ setBusy(btn,false); }
+}
+async function loadCoreData(force=false){
+  if(__coreLoaded && !force) return true;
+  if(__coreLoading && !force) return __coreLoading;
+  __coreLoading=(async()=>{
+    const boot=await apiOnce('bootstrapLite','bootstrapLite',{});
+    me=boot.user||me; users=boot.users||users||[]; window.me=me; window.users=users;
+    categories=boot.categories||categories||[]; criteria=boot.criteria||criteria||[];
+    permissions=boot.permissions||permissions||localDefaultPermissions(); rolePermissions=boot.rolePermissions||rolePermissions||[];
+    taskGroups=(boot.taskGroups||categories.filter(c=>c.CategoryType==='TaskGroup'));
+    window.taskGroups=taskGroups;
+    renderEnterpriseTopbar(); fillSelects(); applyPermissionsFast(); __coreLoaded=true; return true;
+  })();
+  return __coreLoading;
+}
+async function loadAll(){
+  await loadCoreData(true);
+  __pageLoaded={};
+  await loadPageData(getActivePageName()||'dashboard',true);
+}
+async function loadDashboardFast(force=false){
+  const kpiBox=$('kpiCards');
+  if(kpiBox && (!tasks.length||force)) kpiBox.innerHTML='<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+  const dash=await apiOnce('dashboardLite','dashboardLite',{mode:__dashboardMode, unit:dashboardUnitFilter||'ALL'});
+  tasks=dash.tasks||tasks||[];
+  renderDashboardOptimized(dash);
+  refreshUnitFilterSelects();
+  scheduleRealtimeKpi();
+}
+async function loadTasksFast(force=false){
+  const tbody=$('taskRows');
+  if(tbody && (!tasks.length||force)) tbody.innerHTML='<tr><td colspan="10"><div class="skeleton"></div></td></tr>';
+  await loadTasks();
+}
+async function loadTasks(){
+  await loadCoreData();
+  const params={q:$('q')?.value||'',group:$('filterGroup')?.value||'Tất cả',status:$('filterStatus')?.value||'Tất cả',unit:($('filterUnit')?.value||taskUnitFilter||'ALL')};
+  const data=await apiOnce('listTasksLite','listTasksLite',params);
+  tasks=data.tasks||[];
+  window.tasks=tasks;
+  __v103RenderedCount=__v103PageSize;
+  refreshUnitFilterSelects(); renderTasks(); scheduleRealtimeKpi();
+}
+function renderTasks(){
+  if(__renderTimer) cancelAnimationFrame(__renderTimer);
+  __renderTimer=requestAnimationFrame(()=>renderTasksNow());
+}
+function renderTasksNow(){
+  const q=($('q')?.value||'').toLowerCase(), fg=$('filterGroup')?.value||'Tất cả', fs=$('filterStatus')?.value||'Tất cả', fu=$('filterUnit')?.value||taskUnitFilter||'ALL';
+  const sig=[(tasks||[]).length,q,fg,fs,fu,__v103RenderedCount,(tasks||[]).map(t=>t.TaskID+':'+t.Progress+':'+t.Status).slice(0,60).join('|')].join('::');
+  if(sig===__lastRenderSig) return; __lastRenderSig=sig; taskUnitFilter=fu;
+  const userMap=new Map((users||[]).map(u=>[String(u.UserID),u]));
+  const arr=(tasks||[]).filter(t=>(fg==='Tất cả'||t.TaskGroup===fg)&&(fs==='Tất cả'||t.Status===fs)&&taskMatchesUnit(t,fu)&&((t.__search||(t.__search=JSON.stringify(t).toLowerCase())).includes(q)));
+  const shown=arr.slice(0,__v103RenderedCount);
+  const tbody=$('taskRows'); if(!tbody) return;
+  tbody.innerHTML=shown.map((t,idx)=>{
+    const stClass=t.Status==='Hoàn thành'?'st-ok':(['Chậm tiến độ','Nguy cơ'].includes(t.Status)?'st-risk':(['Đúng tiến độ','Đang thực hiện'].includes(t.Status)?'st-run':'st-warn'));
+    const workflowPeople=assignedWorkflowPeopleForTask(t)||[];
+    const mainNames=workflowPeople.filter(x=>['Main','Người chính','Thực hiện chính'].includes(String(x.AssignmentRole||x.StepRole||''))).map(x=>x.SupportPersonName).filter(Boolean);
+    const allAssigned=workflowPeople.map(x=>x.SupportPersonName).filter(Boolean);
+    const creator=t.CreatedByName||taskCreatorName(t);
+    const main=mainNames.join(', ')||(t.UnitMainNames||'')||(allAssigned.length?allAssigned.slice(0,2).join(', '):(userMap.get(String(t.LeadPersonID))?.FullName||'Chưa phân công'));
+    const sup=(t.UnitSupportNames||'')||allAssigned.filter(n=>!mainNames.includes(n)).join(', ');
+    const action=canOpenTaskDetail(t)?`<div class="table-actions-compact"><button class="btn secondary" onclick="openTaskById('${esc(t.TaskID)}')">Mở</button></div>`:'<span class="muted">Không có quyền mở</span>';
+    return `<tr><td data-label="STT"><b>${idx+1}</b></td><td data-label="Nhiệm vụ" style="min-width:320px"><b>${esc(t.TaskName)}</b><div class="muted">${esc(t.TaskGroup)} · Tạo bởi: ${esc(creator)}</div></td><td data-label="Người chính / hỗ trợ"><b>Thực hiện:</b> ${esc(main)}<br><span class="muted"><b>Hỗ trợ:</b> ${esc(sup||'Chưa phân công')}</span></td><td data-label="Đơn vị">${esc(t.HostUnit||workflowUnitsForGroupClient(t.TaskGroup).join(', '))}</td><td data-label="KPI">${esc(t.KPIText)}</td><td data-label="Deadline">${esc(fmtDate(t.DueDate))}</td><td data-label="Tiến độ">${buildTaskListProgressCell(t)}</td><td data-label="Trạng thái"><span class="pill ${stClass}">${esc(t.Status)}</span></td><td data-label="Xếp loại cuối">${esc(t.FinalStatus||t.LeaderFinalRating||t.ManagerRating||'Chưa đánh giá')}</td><td data-label="Thao tác">${action}</td></tr>`;
+  }).join('') || '<tr><td data-label="Kết quả" colspan="10"><div class="muted">Không có nhiệm vụ phù hợp.</div></td></tr>';
+  if(arr.length>shown.length){
+    tbody.insertAdjacentHTML('beforeend',`<tr><td colspan="10" data-label="Tải thêm"><button class="btn secondary" style="width:100%" onclick="__v103RenderedCount+=__v103PageSize; __lastRenderSig=''; renderTasks()">Tải thêm ${Math.min(__v103PageSize, arr.length-shown.length)} nhiệm vụ (${shown.length}/${arr.length})</button></td></tr>`);
+  }
+  if(typeof preloadWorkflowProgressForTasks==='function') idleRun(()=>preloadWorkflowProgressForTasks(shown.slice(0,12)));
+}
+async function openTaskById(taskId){
+  try{
+    let t=(tasks||[]).find(x=>String(x.TaskID)===String(taskId));
+    if(!t){ alert('Không tìm thấy nhiệm vụ: '+taskId); return; }
+    if(!canOpenTaskDetail(t)){ alert('Bạn không có quyền mở chi tiết nhiệm vụ này.'); return; }
+    currentTask=t;
+    if(!__v103TaskDetailCache[taskId]){
+      api('getTaskDetailLazy',{taskId}).then(d=>{ if(d&&d.task){ __v103TaskDetailCache[taskId]=d.task; if(currentTask && String(currentTask.TaskID)===String(taskId)){ currentTask=Object.assign({}, currentTask, d.task); fillTaskFormV103(currentTask); } } }).catch(e=>console.warn(e));
+    } else t=Object.assign({}, t, __v103TaskDetailCache[taskId]);
+    fillTaskFormV103(t);
+    setSupportAssignVisibility(); setDefaultEvaluationByRole();
+    setTaskInfoReadonly(!canEditTaskInfo(t)); applyTaskAssignmentPermission(false);
+    showTaskTab('info', document.querySelector('#taskModal .tabs button'));
+    $('taskModal').classList.add('show');
+  }catch(e){ console.error(e); alert('Không mở được nhiệm vụ: '+(e.message||e)); }
+}
+function fillTaskFormV103(t){
+  currentTask=t||{};
+  const set=(id,val)=>{ const el=$(id); if(el) el.value=val==null?'':val; };
+  set('TaskID', t.TaskID); set('TaskIDDisplay', t.TaskID); set('TaskGroup', t.TaskGroup); set('TaskName', t.TaskName);
+  set('Description', t.Description||'');
+  try{ if(typeof fillCreatorSelect==='function') fillCreatorSelect(t); else set('LeadPersonID', t.LeadPersonID||''); }catch(e){ set('LeadPersonID', t.LeadPersonID||''); }
+  set('HostUnit', t.HostUnit || workflowUnitsForGroupClient(t.TaskGroup).join(', '));
+  set('StartDate', String(t.StartDate||'').slice(0,10)); set('DueDate', String(t.DueDate||'').slice(0,10));
+  set('Progress', t.Progress||0); set('Status', t.Status||'Chờ duyệt'); set('Priority', t.Priority||'Trung bình');
+  set('Quarter', t.Quarter||'Q1'); set('Year', t.Year||new Date().getFullYear());
+  set('KPIText', t.KPIText||''); set('ExpectedOutput', t.ExpectedOutput||'');
+  set('UpdProgress', t.Progress||0); set('UpdStatus', t.Status||'Đang thực hiện');
+  ['evidenceList','evaluationList','taskWorkflowBox','supportTaskList','supportReportBox'].forEach(id=>{ const el=$(id); if(el) el.innerHTML='<div class="muted">Dữ liệu sẽ tải khi mở tab tương ứng.</div>'; });
+}
+function openTaskModal(){
+  currentTask=null; v103ClearClientCache();
+  ['TaskID','TaskIDDisplay','TaskName','Description','KPIText','ExpectedOutput','AssignmentsText'].forEach(id=>{ if($(id)) $(id).value=''; });
+  if($('SupportPersonIDs')) Array.from($('SupportPersonIDs').options).forEach(o=>o.selected=false);
+  if($('Progress')) $('Progress').value=0; if($('Status')) $('Status').value='Chờ duyệt';
+  const n=new Date(); if($('Year')) $('Year').value=n.getFullYear(); if($('Quarter')) $('Quarter').value='Q'+(Math.floor(n.getMonth()/3)+1);
+  try{ fillCreatorSelect(null); updateHostUnitsFromWorkflow(); }catch(e){}
+  setTaskInfoReadonly(false); applyTaskAssignmentPermission(true); setSupportAssignVisibility(); setDefaultEvaluationByRole();
+  showTaskTab('info', document.querySelector('#taskModal .tabs button')); $('taskModal').classList.add('show');
+}
+async function v103LoadTaskTab(tab){
+  if(!currentTask || !currentTask.TaskID) return;
+  const taskId=currentTask.TaskID;
+  const key=v103TaskCacheKey(taskId,tab);
+  if(__v103TabCache[key]) return __v103ApplyTabData(tab,__v103TabCache[key]);
+  const loaders={
+    progress:()=>api('getTaskTabData',{taskId,tab:'progress'}),
+    evidence:()=>api('getTaskTabData',{taskId,tab:'evidence'}),
+    supportAssign:()=>api('getTaskTabData',{taskId,tab:'supportAssign'}),
+    supportReport:()=>api('getTaskTabData',{taskId,tab:'supportReport'}),
+    eval:()=>api('getTaskTabData',{taskId,tab:'eval'})
+  };
+  if(!loaders[tab]) return;
+  const data=await loaders[tab]();
+  __v103TabCache[key]=data;
+  __v103ApplyTabData(tab,data);
+}
+function __v103ApplyTabData(tab,data){
+  if(tab==='evidence'){
+    const ev=data.evidence||[];
+    if($('evidenceList')) $('evidenceList').innerHTML='<b>Minh chứng đã lưu</b><br>'+(ev.length?ev.map(e=>`• ${esc(e.EvidenceType)} - <a href="${esc(e.Url)}" target="_blank">${esc(e.Title)}</a>`).join('<br>'):'<span class="muted">Chưa có minh chứng.</span>');
+  }
+  if(tab==='eval'){
+    currentEvaluations=data.evaluations||[];
+    if($('evaluationList')) $('evaluationList').innerHTML='<b>Đánh giá đã lưu</b><br>'+(currentEvaluations.length?currentEvaluations.map(e=>`• ${esc(e.Level)} - ${esc(e.EvaluatorName)}: <b>${esc(e.Rating)}</b> (${esc(e.TotalScore)})`).join('<br>'):'<span class="muted">Chưa có đánh giá.</span>');
+    try{ renderSupportEvaluationDashboard(); }catch(e){}
+  }
+  if(tab==='supportAssign' || tab==='supportReport'){
+    taskWorkflow={steps:data.steps||[], supportTasks:data.supportTasks||[]};
+    try{ renderTaskWorkflowBox(); }catch(e){}
+    try{ renderTaskOverallProgressDashboard(); }catch(e){}
+    try{ renderSupportEvaluationDashboard(); }catch(e){}
+  }
+  if(tab==='progress'){
+    const updates=data.updates||[];
+    const box=$('progressHistoryBox')||$('taskProgressHistory')||$('supportReportBox');
+    if(box) box.innerHTML=renderTimeline(updates);
+  }
+}
+function showTaskTab(p,btn){
+  document.querySelectorAll('#taskModal .tabs button').forEach(b=>b.classList.remove('active')); if(btn) btn.classList.add('active');
+  ['info','progress','evidence','supportAssign','supportReport','eval'].forEach(x=>{ const el=$('taskTab-'+x); if(el) el.classList.toggle('active', x===p); });
+  if(p==='info') return;
+  const target=$('taskTab-'+p);
+  if(target && !target.dataset.v103Loading){
+    target.dataset.v103Loading='1';
+    const old=target.querySelector('.v103-tab-loading');
+    if(!old) target.insertAdjacentHTML('afterbegin','<div class="v103-tab-loading muted" style="margin-bottom:10px">Đang tải dữ liệu tab...</div>');
+  }
+  v103LoadTaskTab(p).catch(e=>toastPro(e.message,'err')).finally(()=>{ const l=document.querySelector('#taskTab-'+p+' .v103-tab-loading'); if(l) l.remove(); if(target) delete target.dataset.v103Loading; });
+}
+async function saveTask(){
+  try{
+    const task={TaskID:$('TaskID').value,TaskGroup:$('TaskGroup').value,TaskName:$('TaskName').value,Description:$('Description').value,LeadPersonID:($('LeadPersonID')?.value||me?.UserID||''),HostUnit:($('HostUnit')?.value||me?.Unit||''),KPIText:$('KPIText').value,ExpectedOutput:$('ExpectedOutput').value,StartDate:$('StartDate').value,DueDate:$('DueDate').value,Progress:Number($('Progress').value||0),Status:$('Status').value||'Chờ duyệt',Priority:$('Priority').value,Quarter:$('Quarter').value,Year:Number($('Year').value||new Date().getFullYear()),EvidenceStatus:'Thiếu',assignments:(typeof parseAssignments==='function'?parseAssignments($('AssignmentsText')?.value||'', $('TaskID').value):[])};
+    await api('saveTask',{task}); await api('clearWorkhubCache',{}).catch(()=>{}); v103ClearClientCache(); toastPro('Đã lưu nhiệm vụ','ok'); closeModal('taskModal'); __pageLoaded.tasks=false; __pageLoaded.dashboard=false; await loadTasksFast(true);
+  }catch(e){ alert(e.message); }
+}
+async function saveProgress(){
+  try{ await api('saveProgress',{update:{TaskID:$('TaskID').value,Progress:Number($('UpdProgress').value||0),Status:$('UpdStatus').value,Issue:$('UpdIssue')?.value||'',NextAction:$('UpdNextAction')?.value||''}}); await api('clearWorkhubCache',{}).catch(()=>{}); v103ClearClientCache(); toastPro('Đã cập nhật tiến độ','ok'); __pageLoaded.tasks=false; __pageLoaded.dashboard=false; await loadTasksFast(true); }
+  catch(e){ alert(e.message); }
+}
+async function saveEvidence(){
+  try{ await api('saveEvidence',{evidence:{TaskID:$('TaskID').value,EvidenceType:$('EvidenceType').value,Title:$('EvidenceTitle').value,Url:$('EvidenceUrl').value,Note:$('EvidenceNote').value}}); await api('clearWorkhubCache',{}).catch(()=>{}); const key=v103TaskCacheKey($('TaskID').value,'evidence'); delete __v103TabCache[key]; toastPro('Đã lưu minh chứng','ok'); await v103LoadTaskTab('evidence'); }
+  catch(e){ alert(e.message); }
+}
 </script>
 
 <style>
